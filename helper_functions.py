@@ -1,4 +1,6 @@
 import ast
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import constants as const
@@ -50,6 +52,55 @@ INNER_FOLDS_ML = const.INNER_FOLDS_SARIMA
 LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
+
+def log_progress(message):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+def series_label(meta):
+    series_id = str(meta.get("series_id", "unknown"))
+    region = str(meta.get("region", "")).strip()
+    commodity_name = str(meta.get("commodity_name", "")).strip()
+
+    name_parts = [part for part in [commodity_name, region] if part and part.lower() != "nan"]
+    if not name_parts:
+        return series_id
+
+    return f"{' | '.join(name_parts)} [{series_id}]"
+
+
+def log_completed_task(task_name, completed, total, item_label=None, status="completed"):
+    suffix = f" - {item_label}" if item_label else ""
+    log_progress(f"{task_name}: {status} {completed}/{total}{suffix}")
+
+
+@contextmanager
+def joblib_progress(task_name, total):
+    if total <= 0:
+        log_progress(f"{task_name}: no tasks queued")
+        yield
+        return
+
+    completed = {"count": 0}
+    original_callback = joblib.parallel.BatchCompletionCallBack
+
+    class ProgressBatchCompletionCallback(original_callback):
+        def __call__(self, *args, **kwargs):
+            completed["count"] += self.batch_size
+            finished = min(completed["count"], total)
+            log_progress(f"{task_name}: completed {finished}/{total}")
+            return super().__call__(*args, **kwargs)
+
+    joblib.parallel.BatchCompletionCallBack = ProgressBatchCompletionCallback
+    log_progress(f"{task_name}: started 0/{total}")
+
+    try:
+        yield
+    finally:
+        joblib.parallel.BatchCompletionCallBack = original_callback
+        log_progress(f"{task_name}: finished {min(completed['count'], total)}/{total}")
+
 
 def transform_series(series, mode):
     series = pd.to_numeric(series, errors="coerce").astype(float)
