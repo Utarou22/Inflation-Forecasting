@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Thesis Forecast Dashboard</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+</head>
+<body>
+  <main class="layout">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Commodity Forecast Web App</p>
+        <h1>Actual, forecast, and click-through diagnostics in one view.</h1>
+      </div>
+      <div class="hero-meta">
+        <div class="meta-card">
+          <span class="meta-label">Target</span>
+          <strong id="target-label">Loading...</strong>
+        </div>
+        <div class="meta-card">
+          <span class="meta-label">Forecast Horizon</span>
+          <strong id="forecast-horizon">-</strong>
+        </div>
+        <div class="meta-card">
+          <span class="meta-label">Generated</span>
+          <strong id="generated-at">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="controls">
+      <label>
+        <span>Commodity</span>
+        <select id="commodity-select"></select>
+      </label>
+      <label>
+        <span>Region</span>
+        <select id="region-select"></select>
+      </label>
+      <label>
+        <span>Model</span>
+        <select id="model-select"></select>
+      </label>
+      <label>
+        <span>View</span>
+        <select id="view-select">
+          <option value="actual-vs-forecast">Actual vs Forecast</option>
+          <option value="actual-only">Actual Only</option>
+          <option value="forecast-only">Forecast Only</option>
+        </select>
+      </label>
+    </section>
+
+    <section class="summary" id="series-summary"></section>
+
+    <section class="content-grid">
+      <div class="chart-card">
+        <div class="card-header">
+          <h2>Interactive Price View</h2>
+          <p>Hover to inspect price and YoY. Click a plotted point for detailed diagnostics.</p>
+        </div>
+        <div id="chart"></div>
+      </div>
+
+      <aside class="sidebar">
+        <div class="panel">
+          <div class="card-header">
+            <h2>Metrics</h2>
+            <p>Series-level and global holdout performance for the selected model.</p>
+          </div>
+          <div class="metrics-grid" id="metrics-grid"></div>
+        </div>
+      </aside>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
