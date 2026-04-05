@@ -323,11 +323,11 @@ else:
     modeling_series_cap = len(all_eligible_series_manifest)
 
 eligible_series_manifest = (
-    all_eligible_series_manifest.sort_values(
-        ["months_total", "yoy_rows", "region", "commodity_name"],
-        ascending=[False, False, True, True],
+    hf.select_series_manifest_balanced(
+        all_eligible_series_manifest,
+        modeling_series_cap,
+        group_col="region",
     )
-    .reset_index(drop=True)
 )
 
 eligible_series_ids = set(eligible_series_manifest["series_id"])
@@ -342,9 +342,14 @@ eligibility_overview = pd.DataFrame(
             "all_series": regional_series_manifest["series_id"].nunique(),
             "selected_series_for_modeling": eligible_series_manifest["series_id"].nunique(),
             "selection_cap": modeling_series_cap,
+            "selection_strategy": "balanced_by_region_with_global_fill" if modeling_series_cap < len(all_eligible_series_manifest) else "full_manifest",
             "eligible_panel_rows": len(eligible_panel),
             "eligible_unique_commodities": eligible_panel["commodity_name"].nunique(),
+            "all_regions": regional_series_manifest["region"].nunique(),
             "eligible_regions": eligible_panel["region"].nunique(),
+            "region_coverage_pct": float(
+                (eligible_panel["region"].nunique() / regional_series_manifest["region"].nunique()) * 100
+            ) if regional_series_manifest["region"].nunique() else np.nan,
         }
     ]
 )

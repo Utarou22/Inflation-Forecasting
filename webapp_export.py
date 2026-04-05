@@ -27,6 +27,8 @@ MIN_TRAIN_OBS_SARIMA = const.MIN_TRAIN_OBS_SARIMA
 MIN_TRAIN_OBS_ML = const.MIN_TRAIN_OBS_ML
 SARIMA_MAXITER = const.SARIMA_MAXITER
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
+MODEL_SERIES_CAP = const.MODEL_SERIES_CAP
+MODEL_SERIES_CAP_FALLBACK = const.MODEL_SERIES_CAP_FALLBACK
 SVR_BASE_FEATURES = const.SVR_BASE_FEATURES
 LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 FORECAST_MONTHS = 12
@@ -214,20 +216,19 @@ def prepare_base_panel():
     regional_series_manifest, regional_preprocessed_panel = hf.build_series_manifest(regional_preprocessed_full)
     all_eligible_series_manifest = regional_series_manifest.copy()
 
-    if len(all_eligible_series_manifest) >= 100:
-        modeling_series_cap = 100
-    elif len(all_eligible_series_manifest) >= 50:
-        modeling_series_cap = 50
+    if len(all_eligible_series_manifest) >= MODEL_SERIES_CAP:
+        modeling_series_cap = MODEL_SERIES_CAP
+    elif len(all_eligible_series_manifest) >= MODEL_SERIES_CAP_FALLBACK:
+        modeling_series_cap = MODEL_SERIES_CAP_FALLBACK
     else:
         modeling_series_cap = len(all_eligible_series_manifest)
 
     eligible_series_manifest = (
-        all_eligible_series_manifest.sort_values(
-            ["months_total", "yoy_rows", "region", "commodity_name"],
-            ascending=[False, False, True, True],
+        hf.select_series_manifest_balanced(
+            all_eligible_series_manifest,
+            modeling_series_cap,
+            group_col="region",
         )
-        .head(modeling_series_cap)
-        .reset_index(drop=True)
     )
 
     eligible_series_ids = set(eligible_series_manifest["series_id"])

@@ -300,6 +300,63 @@ def build_series_manifest(panel):
     window_panel = pd.concat(windowed_parts, ignore_index=True) if windowed_parts else panel.iloc[0:0].copy()
     return manifest, window_panel
 
+
+def select_series_manifest_balanced(
+    manifest,
+    cap,
+    group_col="region",
+    sort_cols=None,
+    ascending=None,
+):
+    if sort_cols is None:
+        sort_cols = ["months_total", "yoy_rows", "region", "commodity_name"]
+    if ascending is None:
+        ascending = [False, False, True, True]
+
+    ordered = manifest.sort_values(sort_cols, ascending=ascending).reset_index(drop=True).copy()
+    if ordered.empty:
+        return ordered
+
+    ordered["_selection_group"] = ordered[group_col].fillna("Unspecified").astype(str)
+    ordered["selection_global_rank"] = np.arange(1, len(ordered) + 1)
+    ordered["selection_group_rank"] = ordered.groupby("_selection_group").cumcount() + 1
+
+    if cap is None or cap <= 0 or len(ordered) <= cap:
+        ordered["selection_stage"] = "full_manifest"
+        ordered["selection_rank"] = np.arange(1, len(ordered) + 1)
+        return ordered.drop(columns=["_selection_group"])
+
+    group_count = ordered["_selection_group"].nunique()
+    if group_count == 0 or cap < group_count:
+        selected = ordered.head(cap).copy()
+        selected["selection_stage"] = "global_fill"
+        selected["selection_rank"] = np.arange(1, len(selected) + 1)
+        return selected.drop(columns=["_selection_group"])
+
+    base_quota = cap // group_count
+    selected_idx = []
+    selection_stage = {}
+
+    for _, group_part in ordered.groupby("_selection_group", sort=False):
+        quota_take = group_part.head(base_quota)
+        for idx in quota_take.index:
+            selected_idx.append(idx)
+            selection_stage[idx] = "group_quota"
+
+    remaining_slots = cap - len(selected_idx)
+    if remaining_slots > 0:
+        remaining_idx = [idx for idx in ordered.index if idx not in selection_stage]
+        for idx in remaining_idx[:remaining_slots]:
+            selected_idx.append(idx)
+            selection_stage[idx] = "global_fill"
+
+    selected = ordered.loc[selected_idx].sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+    selected["selection_stage"] = selected["selection_global_rank"].map(
+        {ordered.loc[idx, "selection_global_rank"]: stage for idx, stage in selection_stage.items()}
+    )
+    selected["selection_rank"] = np.arange(1, len(selected) + 1)
+    return selected.drop(columns=["_selection_group"])
+
 def lagged_autocorr(series, lag):
     series = pd.Series(series).dropna()
     if len(series) <= lag:
