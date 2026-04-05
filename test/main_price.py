@@ -102,6 +102,17 @@ def print_table(title, df):
 Path("tables_price").mkdir(exist_ok=True)
 Path("visuals_price").mkdir(exist_ok=True)
 
+metric_scaling_overview = pd.DataFrame([
+    {
+        "target_column": TARGET_COL,
+        "rmse_output_column": "rmse_0_1",
+        "mae_output_column": "mae_0_1",
+        "normalization_formula": "min(error / (max(actual) - min(actual)), 1.0)",
+        "scope": "computed separately within each evaluated table subset",
+    }
+])
+metric_scaling_overview.to_html("tables_price/0.0 Metric Scaling Overview.html", index=False)
+
 hf.TARGET_COL = TARGET_COL
 hf.TARGET_LABEL = TARGET_LABEL
 
@@ -426,11 +437,11 @@ else:
     modeling_series_cap = len(all_eligible_series_manifest)
 
 eligible_series_manifest = (
-    all_eligible_series_manifest.sort_values(
-        ["months_total", "yoy_rows", "region", "commodity_name"],
-        ascending=[False, False, True, True],
+    hf.select_series_manifest_balanced(
+        all_eligible_series_manifest,
+        modeling_series_cap,
+        group_col="region",
     )
-    .reset_index(drop=True)
 )
 
 eligible_series_ids = set(eligible_series_manifest["series_id"])
@@ -445,9 +456,14 @@ eligibility_overview = pd.DataFrame(
             "all_series": regional_series_manifest["series_id"].nunique(),
             "selected_series_for_modeling": eligible_series_manifest["series_id"].nunique(),
             "selection_cap": modeling_series_cap,
+            "selection_strategy": "balanced_by_region_with_global_fill" if modeling_series_cap < len(all_eligible_series_manifest) else "full_manifest",
             "eligible_panel_rows": len(eligible_panel),
             "eligible_unique_commodities": eligible_panel["commodity_name"].nunique(),
+            "all_regions": regional_series_manifest["region"].nunique(),
             "eligible_regions": eligible_panel["region"].nunique(),
+            "region_coverage_pct": float(
+                (eligible_panel["region"].nunique() / regional_series_manifest["region"].nunique()) * 100
+            ) if regional_series_manifest["region"].nunique() else np.nan,
         }
     ]
 )
@@ -860,6 +876,13 @@ sarima_series_metrics.to_html("tables_price/2.1.f Series Forecast Metrics.html",
 
 sarima_residual_diagnostics = hf.compute_diagnostics(sarima_predictions, prediction_pairs)
 sarima_residual_diagnostics.to_html("tables_price/2.1.g Residual Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    sarima_predictions,
+    prediction_pairs,
+    "visuals_price/2.2.d Residual Histograms.png",
+    "visuals_price/2.2.e Residual QQ Plots.png",
+    "Price SARIMA Evaluation",
+)
 
 # Visual 1: Benchmark comparison
 if not sarima_global_metrics.empty:
@@ -999,6 +1022,13 @@ non_linear_predictions.to_html("tables_price/3.1.d SVR Predictions.html", index=
 svr_global_metrics.to_html("tables_price/3.1.e SVR Global Metrics.html", index=False)
 svr_series_metrics.to_html("tables_price/3.1.f SVR Series Metrics.html", index=False)
 svr_residual_diagnostics.to_html("tables_price/3.1.g SVR Residual Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    non_linear_predictions,
+    svr_prediction_pairs,
+    "visuals_price/3.2.c Residual Histograms.png",
+    "visuals_price/3.2.d Residual QQ Plots.png",
+    "Price SVR Evaluation",
+)
 print_table("SVR Run Overview", svr_run_overview)
 
 # Visual 1: Benchmark comparison
@@ -1121,6 +1151,13 @@ lightgbm_predictions.to_html("tables_price/4.1.d LightGBM Predictions.html", ind
 lightgbm_global_metrics.to_html("tables_price/4.1.e LightGBM Global Metrics.html", index=False)
 lightgbm_series_metrics.to_html("tables_price/4.1.f LightGBM Series Metrics.html", index=False)
 lightgbm_diagnostics.to_html("tables_price/4.1.g LightGBM Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    non_linear_predictions,
+    lightgbm_prediction_pairs,
+    "visuals_price/4.2.b Residual Histograms.png",
+    "visuals_price/4.2.c Residual QQ Plots.png",
+    "Price LightGBM Evaluation",
+)
 print_table("LightGBM Run Overview", lightgbm_run_overview)
 
 # Visual 1: LightGBM benchmark comparison
@@ -1250,6 +1287,35 @@ ensemble_series_metrics.to_html("tables_price/5.1.e Ensemble Series Metrics.html
 ensemble_diagnostics.to_html("tables_price/5.1.f Ensemble Diagnostics.html", index=False)
 ensemble_series_diagnostics.to_html("tables_price/5.1.g Ensemble Series Diagnostics.html",index=False)
 diagnostic_summary.to_html("tables_price/5.1.h Ensemble Diagnostic Summary.html",index=False)
+hf.save_residual_distribution_plots(
+    ensemble_predictions,
+    ensemble_prediction_pairs,
+    "visuals_price/5.2.c Residual Histograms.png",
+    "visuals_price/5.2.d Residual QQ Plots.png",
+    "Price Ensemble Evaluation",
+)
+
+artifacts_root = Path("artifacts_price")
+artifact_manifest = hf.export_model_artifacts(
+    panel=eligible_panel,
+    sarima_settings=sarima_model_settings,
+    svr_settings=svr_model_settings,
+    lightgbm_settings=lightgbm_model_settings,
+    ensemble_weights=ensemble_weights,
+    artifacts_root=artifacts_root,
+)
+artifact_export_overview = (
+    artifact_manifest.groupby("model", as_index=False)
+    .agg(
+        artifacts_saved=("status", lambda values: int((pd.Series(values) == "saved").sum())),
+        artifacts_attempted=("status", "size"),
+        rows_trained_median=("rows_trained", "median"),
+    )
+    .sort_values("model")
+    .reset_index(drop=True)
+)
+artifact_manifest.to_html("tables_price/5.1.i Artifact Manifest.html", index=False)
+artifact_export_overview.to_html("tables_price/5.1.j Artifact Export Overview.html", index=False)
 
 # Visual 1: Ensemble benchmark comparison
 if not ensemble_global_metrics.empty:

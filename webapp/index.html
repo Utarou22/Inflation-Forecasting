@@ -68,9 +68,16 @@
         <div class="panel">
           <div class="card-header">
             <h2>Metrics</h2>
-            <p>Series-level and global holdout performance for the selected model.</p>
+            <p>Series-level diagnostics support cross-series comparison, while overall pooled metrics remain the primary ranking basis.</p>
           </div>
           <div class="metrics-grid" id="metrics-grid"></div>
+        </div>
+        <div class="panel">
+          <div class="card-header">
+            <h2>Point Diagnostics</h2>
+            <p>Click a historical, holdout, or forecast point to inspect the row-level values.</p>
+          </div>
+          <div class="detail-list empty-state" id="point-details">Click a point to inspect it.</div>
         </div>
       </aside>
     </section>

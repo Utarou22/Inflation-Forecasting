@@ -113,6 +113,70 @@ function buildMetricCards(seriesId) {
     .join("");
 }
 
+function buildMetricCardsEnhanced(seriesId) {
+  const seriesMetric = state.data.series_metrics.find(
+    (row) => row.series_id === seriesId && row.model === state.selectedModel
+  );
+  const globalMetric = state.data.global_metrics.find((row) => row.model === state.selectedModel);
+  const consistencyMetric = (state.data.model_consistency_summary || []).find(
+    (row) => row.model === state.selectedModel
+  );
+
+  const sections = [
+    {
+      title: "Series-Level Performance",
+      subtitle: "Use this to compare the selected commodity-region series across models.",
+      cards: [
+        { label: "Series RMSE", value: fmtNumber(seriesMetric?.rmse) },
+        { label: "Series MAE", value: fmtNumber(seriesMetric?.mae) },
+        { label: "Series R2", value: fmtNumber(seriesMetric?.r2) },
+        { label: "Series NRMSE", value: fmtNumber(seriesMetric?.nrmse_range) },
+        { label: "Series NMAE", value: fmtNumber(seriesMetric?.nmae_range) },
+        { label: "Series YoY Range", value: fmtNumber(seriesMetric?.holdout_actual_range_yoy) },
+        { label: "Series Holdout Rows", value: fmtNumber(seriesMetric?.rows_evaluated, 0) },
+      ],
+    },
+    {
+      title: "Overall Performance",
+      subtitle: "Primary pooled holdout metrics for selecting the best overall model.",
+      cards: [
+        { label: "Global RMSE", value: fmtNumber(globalMetric?.rmse) },
+        { label: "Global MAE", value: fmtNumber(globalMetric?.mae) },
+        { label: "Global R2", value: fmtNumber(globalMetric?.r2) },
+        { label: "Global Holdout Rows", value: fmtNumber(globalMetric?.rows_evaluated, 0) },
+        { label: "Mean Series NRMSE", value: fmtNumber(consistencyMetric?.mean_series_nrmse) },
+        { label: "Median Series NRMSE", value: fmtNumber(consistencyMetric?.median_series_nrmse) },
+        { label: "Best-Series Wins", value: fmtNumber(consistencyMetric?.best_series_wins, 0) },
+      ],
+    },
+  ];
+
+  elements.metrics.innerHTML = sections
+    .map(
+      (section) => `
+        <section class="metric-section">
+          <header class="metric-section-header">
+            <h3>${section.title}</h3>
+            <p>${section.subtitle}</p>
+          </header>
+          <div class="metric-section-grid">
+            ${section.cards
+              .map(
+                (card) => `
+                  <article class="metric-card">
+                    <span class="metric-label">${card.label}</span>
+                    <strong class="metric-value">${card.value}</strong>
+                  </article>
+                `
+              )
+              .join("")}
+          </div>
+        </section>
+      `
+    )
+    .join("");
+}
+
 function setPointDetails(details) {
   if (!details) {
     elements.pointDetails.className = "detail-list empty-state";
@@ -166,12 +230,7 @@ function buildTrace(rows, config) {
       row.phase,
       row.model,
     ])),
-    hovertemplate:
-      "<b>%{x}</b><br>" +
-      "Actual Price: %{customdata[1]:,.2f}<br>" +
-      "Forecast Price: %{customdata[2]:,.2f}<br>" +
-      "Actual YoY: %{customdata[3]:,.2f}%<br>" +
-      "Forecast YoY: %{customdata[4]:,.2f}%<extra></extra>",
+    hovertemplate: config.hovertemplate,
   };
 }
 
@@ -180,7 +239,7 @@ function renderChart(seriesId) {
   const holdoutRows = filterHoldout(seriesId);
   const futureRows = filterFuture(seriesId);
   buildSeriesSummary(historyRows, futureRows);
-  buildMetricCards(seriesId);
+  buildMetricCardsEnhanced(seriesId);
   setPointDetails(null);
 
   const traces = [];
@@ -204,6 +263,10 @@ function renderChart(seriesId) {
           name: "Actual Price",
           line: { color: "#1e1b16", width: 2.4 },
           marker: { size: 5, color: "#1e1b16" },
+          hovertemplate:
+            "<b>%{x}</b><br>" +
+            "Actual Price: %{customdata[1]:,.2f}<br>" +
+            "Actual YoY: %{customdata[3]:,.2f}%<extra></extra>",
         }
       )
     );
@@ -230,6 +293,12 @@ function renderChart(seriesId) {
             mode: "lines+markers",
             line: { color: "#ad3f2f", width: 2.2, dash: "dash" },
             marker: { size: 7, color: "#ad3f2f" },
+            hovertemplate:
+              "<b>%{x}</b><br>" +
+              "Actual Price: %{customdata[1]:,.2f}<br>" +
+              "Forecast Price: %{customdata[2]:,.2f}<br>" +
+              "Actual YoY: %{customdata[3]:,.2f}%<br>" +
+              "Forecast YoY: %{customdata[4]:,.2f}%<extra></extra>",
           }
         )
       );
@@ -255,6 +324,10 @@ function renderChart(seriesId) {
             mode: "lines+markers",
             line: { color: "#d77d35", width: 2.6 },
             marker: { size: 7, color: "#d77d35", symbol: "diamond" },
+            hovertemplate:
+              "<b>%{x}</b><br>" +
+              "Forecast Price: %{customdata[2]:,.2f}<br>" +
+              "Forecast YoY: %{customdata[4]:,.2f}%<extra></extra>",
           }
         )
       );

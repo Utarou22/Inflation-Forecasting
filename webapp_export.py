@@ -451,6 +451,74 @@ def inverse_rmse_weight(value):
     return 1.0 / float(value)
 
 
+def compute_series_normalized_metrics(holdout_frame):
+    rows = []
+
+    for (series_id, region, commodity_name, model_name), part in holdout_frame.groupby(
+        ["series_id", "region", "commodity_name", "model"]
+    ):
+        valid = part.loc[
+            part["actual_yoy"].notna() & part["predicted_yoy"].notna(),
+            ["actual_yoy", "predicted_yoy"],
+        ].copy()
+        if valid.empty:
+            continue
+
+        actual_range = float(valid["actual_yoy"].max() - valid["actual_yoy"].min())
+        current_rmse = hf.rmse(valid["actual_yoy"], valid["predicted_yoy"])
+        current_mae = hf.mae(valid["actual_yoy"], valid["predicted_yoy"])
+
+        rows.append({
+            "series_id": series_id,
+            "region": region,
+            "commodity_name": commodity_name,
+            "model": model_name,
+            "holdout_actual_range_yoy": actual_range,
+            "nrmse_range": current_rmse / actual_range if actual_range > 0 else np.nan,
+            "nmae_range": current_mae / actual_range if actual_range > 0 else np.nan,
+        })
+
+    metrics = pd.DataFrame(rows)
+    if metrics.empty:
+        return metrics
+
+    metrics["best_series_win"] = False
+    for series_id, part in metrics.groupby("series_id"):
+        valid_part = part.loc[part["nrmse_range"].notna()].copy()
+        if valid_part.empty:
+            continue
+        winner_idx = valid_part.sort_values(["nrmse_range", "model"], ascending=[True, True]).index[0]
+        metrics.loc[winner_idx, "best_series_win"] = True
+
+    return metrics
+
+
+def compute_model_consistency_summary(series_metrics_frame):
+    if series_metrics_frame.empty:
+        return pd.DataFrame(
+            columns=[
+                "model",
+                "series_evaluated",
+                "mean_series_nrmse",
+                "median_series_nrmse",
+                "best_series_wins",
+            ]
+        )
+
+    summary = (
+        series_metrics_frame.groupby("model", as_index=False)
+        .agg(
+            series_evaluated=("series_id", "nunique"),
+            mean_series_nrmse=("nrmse_range", "mean"),
+            median_series_nrmse=("nrmse_range", "median"),
+            best_series_wins=("best_series_win", lambda values: int(pd.Series(values).fillna(False).sum())),
+        )
+        .sort_values(["mean_series_nrmse", "median_series_nrmse", "model"], ascending=[True, True, True])
+        .reset_index(drop=True)
+    )
+    return summary
+
+
 def main():
     eligible_panel, eligible_series_manifest, regional_exogenous_feature_columns = prepare_base_panel()
 
@@ -625,6 +693,24 @@ def main():
 
     series_metrics_export = ensemble_series_metrics.loc[ensemble_series_metrics["model"].isin(APP_MODELS)].copy()
     global_metrics_export = ensemble_global_metrics.loc[ensemble_global_metrics["model"].isin(APP_MODELS)].copy()
+    normalized_series_metrics = compute_series_normalized_metrics(holdout_export)
+    model_consistency_summary = compute_model_consistency_summary(normalized_series_metrics)
+    if not normalized_series_metrics.empty:
+        series_metrics_export = series_metrics_export.merge(
+            normalized_series_metrics[
+                [
+                    "series_id",
+                    "model",
+                    "holdout_actual_range_yoy",
+                    "nrmse_range",
+                    "nmae_range",
+                    "best_series_win",
+                ]
+            ],
+            on=["series_id", "model"],
+            how="left",
+        )
+
     series_options = (
         eligible_series_manifest[["series_id", "region", "commodity_name"]]
         .drop_duplicates()
@@ -644,6 +730,7 @@ def main():
         "future": future_export.where(pd.notna(future_export), None).to_dict(orient="records"),
         "series_metrics": series_metrics_export.where(pd.notna(series_metrics_export), None).to_dict(orient="records"),
         "global_metrics": global_metrics_export.where(pd.notna(global_metrics_export), None).to_dict(orient="records"),
+        "model_consistency_summary": model_consistency_summary.where(pd.notna(model_consistency_summary), None).to_dict(orient="records"),
     }
 
     with (WEBAPP_DATA_DIR / "dashboard.json").open("w", encoding="utf-8") as file_obj:

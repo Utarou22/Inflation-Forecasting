@@ -1,6 +1,8 @@
 import helper_functions as hf
 import constants as const
 
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -762,6 +764,13 @@ sarima_series_metrics.to_html("tables/2.1.f Series Forecast Metrics.html", index
 
 sarima_residual_diagnostics = hf.compute_diagnostics(sarima_predictions, prediction_pairs)
 sarima_residual_diagnostics.to_html("tables/2.1.g Residual Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    sarima_predictions,
+    prediction_pairs,
+    "visuals/2.2.d Residual Histograms.png",
+    "visuals/2.2.e Residual QQ Plots.png",
+    "SARIMA Evaluation",
+)
 
 # Visual 1: Benchmark comparison
 if not sarima_global_metrics.empty:
@@ -901,6 +910,13 @@ non_linear_predictions.to_html("tables/3.1.d SVR Predictions.html", index=False)
 svr_global_metrics.to_html("tables/3.1.e SVR Global Metrics.html", index=False)
 svr_series_metrics.to_html("tables/3.1.f SVR Series Metrics.html", index=False)
 svr_residual_diagnostics.to_html("tables/3.1.g SVR Residual Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    non_linear_predictions,
+    svr_prediction_pairs,
+    "visuals/3.2.c Residual Histograms.png",
+    "visuals/3.2.d Residual QQ Plots.png",
+    "SVR Evaluation",
+)
 print_table("SVR Run Overview", svr_run_overview)
 
 # Visual 1: Benchmark comparison
@@ -1023,6 +1039,13 @@ lightgbm_predictions.to_html("tables/4.1.d LightGBM Predictions.html", index=Fal
 lightgbm_global_metrics.to_html("tables/4.1.e LightGBM Global Metrics.html", index=False)
 lightgbm_series_metrics.to_html("tables/4.1.f LightGBM Series Metrics.html", index=False)
 lightgbm_diagnostics.to_html("tables/4.1.g LightGBM Diagnostics.html", index=False)
+hf.save_residual_distribution_plots(
+    non_linear_predictions,
+    lightgbm_prediction_pairs,
+    "visuals/4.2.b Residual Histograms.png",
+    "visuals/4.2.c Residual QQ Plots.png",
+    "LightGBM Evaluation",
+)
 print_table("LightGBM Run Overview", lightgbm_run_overview)
 
 # Visual 1: LightGBM benchmark comparison
@@ -1152,6 +1175,35 @@ ensemble_series_metrics.to_html("tables/5.1.e Ensemble Series Metrics.html", ind
 ensemble_diagnostics.to_html("tables/5.1.f Ensemble Diagnostics.html", index=False)
 ensemble_series_diagnostics.to_html("tables/5.1.g Ensemble Series Diagnostics.html",index=False)
 diagnostic_summary.to_html("tables/5.1.h Ensemble Diagnostic Summary.html",index=False)
+hf.save_residual_distribution_plots(
+    ensemble_predictions,
+    ensemble_prediction_pairs,
+    "visuals/5.2.c Residual Histograms.png",
+    "visuals/5.2.d Residual QQ Plots.png",
+    "Ensemble Evaluation",
+)
+
+artifacts_root = Path("artifacts")
+artifact_manifest = hf.export_model_artifacts(
+    panel=eligible_panel,
+    sarima_settings=sarima_model_settings,
+    svr_settings=svr_model_settings,
+    lightgbm_settings=lightgbm_model_settings,
+    ensemble_weights=ensemble_weights,
+    artifacts_root=artifacts_root,
+)
+artifact_export_overview = (
+    artifact_manifest.groupby("model", as_index=False)
+    .agg(
+        artifacts_saved=("status", lambda values: int((pd.Series(values) == "saved").sum())),
+        artifacts_attempted=("status", "size"),
+        rows_trained_median=("rows_trained", "median"),
+    )
+    .sort_values("model")
+    .reset_index(drop=True)
+)
+artifact_manifest.to_html("tables/5.1.i Artifact Manifest.html", index=False)
+artifact_export_overview.to_html("tables/5.1.j Artifact Export Overview.html", index=False)
 
 # Visual 1: Ensemble benchmark comparison
 if not ensemble_global_metrics.empty:

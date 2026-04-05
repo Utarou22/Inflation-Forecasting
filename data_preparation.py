@@ -181,21 +181,11 @@ merged["price"] = np.where(
     np.where(
         merged["_merge"].eq("left_only"),
         merged["price_1"],
-        np.where(
-            merged["_merge"].eq("right_only"),
-            merged["price_2"],
-            np.nan
-        )
+        np.where(merged["_merge"].eq("right_only"),merged["price_2"],np.nan)
     )
 )
-resolved = merged[
-    (merged["_merge"] != "both") | (merged["pct_diff"] <= 5)
-].copy()
-
-conflicts = merged[
-    (merged["_merge"] == "both") & (merged["pct_diff"] > 5)
-].copy()
-
+resolved = merged[(merged["_merge"] != "both") | (merged["pct_diff"] <= 5)].copy()
+conflicts = merged[(merged["_merge"] == "both") & (merged["pct_diff"] > 5)].copy()
 resolved["source"] = np.where(
     resolved["_merge"].eq("left_only"), "food_prices",
     np.where(

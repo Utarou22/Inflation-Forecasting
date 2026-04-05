@@ -1,3 +1,6 @@
+import ast
+from pathlib import Path
+
 import constants as const
 
 import pandas as pd
@@ -6,6 +9,7 @@ import matplotlib.pyplot as plt
 import joblib
 import warnings
 
+from statsmodels.graphics.gofplots import qqplot
 from statsmodels.tsa.stattools import adfuller, grangercausalitytests
 from statsmodels.stats.diagnostic import acorr_ljungbox
 from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -523,6 +527,7 @@ def run_sarima_for_series(meta_dict, df):
         folds=INNER_FOLDS_SARIMA,
         min_train=max(MIN_TRAIN_OBS_SARIMA, min(36, len(tuning) - 1))
     )
+
     if not inner_splits:
         return {"settings": None, "predictions": [], "series_id": meta.get("series_id")}
 
@@ -1043,6 +1048,335 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
             })
 
     return pd.DataFrame(prediction_rows), pd.DataFrame(settings_rows)
+
+
+def parse_literal_or_default(value, fallback=None):
+    if isinstance(value, (list, tuple, dict)):
+        return value
+    if pd.isna(value):
+        return fallback
+    try:
+        return ast.literal_eval(str(value))
+    except (SyntaxError, ValueError):
+        return fallback
+
+
+def safe_series_slug(series_id):
+    text = str(series_id)
+    safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text)
+    while "__" in safe:
+        safe = safe.replace("__", "_")
+    return safe.strip("_") or "series"
+
+
+def export_model_artifacts(
+    panel,
+    sarima_settings,
+    svr_settings,
+    lightgbm_settings,
+    ensemble_weights,
+    artifacts_root,
+):
+    artifacts_root = Path(artifacts_root)
+    artifact_dirs = {
+        "SARIMA": artifacts_root / "sarima",
+        "SVR": artifacts_root / "svr",
+        "LightGBM": artifacts_root / "lightgbm",
+        "Weighted Ensemble": artifacts_root / "weighted_ensemble",
+    }
+    for directory in artifact_dirs.values():
+        directory.mkdir(parents=True, exist_ok=True)
+
+    series_lookup = {
+        series_id: frame.sort_values("month").reset_index(drop=True).copy()
+        for series_id, frame in panel.groupby("series_id")
+    }
+    manifest_rows = []
+
+    for _, row in sarima_settings.iterrows():
+        series_id = row["series_id"]
+        series_df = series_lookup.get(series_id)
+        artifact_path = artifact_dirs["SARIMA"] / f"{safe_series_slug(series_id)}.joblib"
+
+        if series_df is None:
+            manifest_rows.append({
+                "model": "SARIMA",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "missing_series",
+                "rows_trained": 0,
+            })
+            continue
+
+        target_history = series_df.loc[series_df[TARGET_COL].notna(), TARGET_COL]
+        order = parse_literal_or_default(row.get("sarima_order"), fallback=None)
+        seasonal_order = parse_literal_or_default(row.get("sarima_seasonal_order"), fallback=None)
+        trend = row.get("sarima_trend", "n")
+
+        if order is None or seasonal_order is None or len(target_history) < MIN_TRAIN_OBS_SARIMA:
+            manifest_rows.append({
+                "model": "SARIMA",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "insufficient_training_data",
+                "rows_trained": int(len(target_history)),
+            })
+            continue
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                fitted = SARIMAX(
+                    target_history,
+                    order=tuple(order),
+                    seasonal_order=tuple(seasonal_order),
+                    trend=trend,
+                    enforce_stationarity=True,
+                    enforce_invertibility=True,
+                ).fit(disp=False, maxiter=SARIMA_MAXITER)
+
+            payload = {
+                "model_type": "SARIMA",
+                "series_id": series_id,
+                "region": row.get("region"),
+                "commodity_name": row.get("commodity_name"),
+                "target_column": TARGET_COL,
+                "order": tuple(order),
+                "seasonal_order": tuple(seasonal_order),
+                "trend": trend,
+                "rows_trained": int(len(target_history)),
+                "train_start_month": series_df["month"].min(),
+                "train_end_month": series_df["month"].max(),
+                "model": fitted,
+            }
+            joblib.dump(payload, artifact_path)
+            status = "saved"
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+
+        manifest_rows.append({
+            "model": "SARIMA",
+            "series_id": series_id,
+            "artifact_path": str(artifact_path),
+            "status": status,
+            "rows_trained": int(len(target_history)),
+        })
+
+    for _, row in svr_settings.iterrows():
+        series_id = row["series_id"]
+        series_df = series_lookup.get(series_id)
+        artifact_path = artifact_dirs["SVR"] / f"{safe_series_slug(series_id)}.joblib"
+        feature_cols = parse_literal_or_default(row.get("selected_features"), fallback=[]) or []
+        best_params = parse_literal_or_default(row.get("svr_best_params"), fallback={}) or {}
+
+        if series_df is None:
+            manifest_rows.append({
+                "model": "SVR",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "missing_series",
+                "rows_trained": 0,
+            })
+            continue
+
+        model_train = series_df.loc[
+            series_df[feature_cols + [TARGET_COL]].notna().all(axis=1),
+            feature_cols + [TARGET_COL],
+        ].copy()
+
+        if not feature_cols or len(model_train) < MIN_TRAIN_OBS_ML:
+            manifest_rows.append({
+                "model": "SVR",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "insufficient_training_data",
+                "rows_trained": int(len(model_train)),
+            })
+            continue
+
+        try:
+            final_model = Pipeline([
+                ("scaler", RobustScaler()),
+                ("svr", SVR(
+                    kernel="rbf",
+                    C=best_params.get("svr__C", 1.0),
+                    epsilon=best_params.get("svr__epsilon", 0.1),
+                    gamma=best_params.get("svr__gamma", "scale"),
+                )),
+            ])
+            final_model.fit(model_train[feature_cols], model_train[TARGET_COL])
+            payload = {
+                "model_type": "SVR",
+                "series_id": series_id,
+                "region": row.get("region"),
+                "commodity_name": row.get("commodity_name"),
+                "target_column": TARGET_COL,
+                "feature_columns": feature_cols,
+                "best_params": best_params,
+                "rows_trained": int(len(model_train)),
+                "train_start_month": series_df["month"].min(),
+                "train_end_month": series_df["month"].max(),
+                "model": final_model,
+            }
+            joblib.dump(payload, artifact_path)
+            status = "saved"
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+
+        manifest_rows.append({
+            "model": "SVR",
+            "series_id": series_id,
+            "artifact_path": str(artifact_path),
+            "status": status,
+            "rows_trained": int(len(model_train)),
+        })
+
+    for _, row in lightgbm_settings.iterrows():
+        series_id = row["series_id"]
+        series_df = series_lookup.get(series_id)
+        artifact_path = artifact_dirs["LightGBM"] / f"{safe_series_slug(series_id)}.joblib"
+        feature_cols = parse_literal_or_default(row.get("selected_features"), fallback=[]) or []
+        exog_cols = parse_literal_or_default(row.get("lightgbm_exogenous_features"), fallback=[]) or []
+        best_params = parse_literal_or_default(row.get("lightgbm_params"), fallback={}) or {}
+
+        if series_df is None:
+            manifest_rows.append({
+                "model": "LightGBM",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "missing_series",
+                "rows_trained": 0,
+            })
+            continue
+
+        model_train = series_df.copy()
+        for col in exog_cols:
+            if col in model_train.columns:
+                model_train[col] = model_train[col].ffill().bfill()
+        model_train = model_train.loc[
+            model_train[feature_cols + [TARGET_COL]].notna().all(axis=1),
+            feature_cols + [TARGET_COL],
+        ].copy()
+
+        if not feature_cols or len(model_train) < MIN_TRAIN_OBS_ML:
+            manifest_rows.append({
+                "model": "LightGBM",
+                "series_id": series_id,
+                "artifact_path": str(artifact_path),
+                "status": "insufficient_training_data",
+                "rows_trained": int(len(model_train)),
+            })
+            continue
+
+        try:
+            model = lgb.LGBMRegressor(
+                objective="regression",
+                random_state=LIGHTGBM_RANDOM_STATE,
+                verbosity=-1,
+                n_jobs=1,
+                force_col_wise=True,
+                max_bin=127,
+                **best_params,
+            )
+            model.fit(model_train[feature_cols], model_train[TARGET_COL])
+            payload = {
+                "model_type": "LightGBM",
+                "series_id": series_id,
+                "region": row.get("region"),
+                "commodity_name": row.get("commodity_name"),
+                "target_column": TARGET_COL,
+                "feature_columns": feature_cols,
+                "exogenous_feature_columns": exog_cols,
+                "best_params": best_params,
+                "rows_trained": int(len(model_train)),
+                "train_start_month": series_df["month"].min(),
+                "train_end_month": series_df["month"].max(),
+                "model": model,
+            }
+            joblib.dump(payload, artifact_path)
+            status = "saved"
+        except Exception as exc:
+            status = f"error:{type(exc).__name__}"
+
+        manifest_rows.append({
+            "model": "LightGBM",
+            "series_id": series_id,
+            "artifact_path": str(artifact_path),
+            "status": status,
+            "rows_trained": int(len(model_train)),
+        })
+
+    ensemble_artifact_path = artifact_dirs["Weighted Ensemble"] / "ensemble_weights.joblib"
+    ensemble_payload = {
+        "model_type": "Weighted Ensemble",
+        "target_column": TARGET_COL,
+        "weights": ensemble_weights.copy(),
+        "component_models": ["SARIMA", "SVR", "LightGBM"],
+    }
+    joblib.dump(ensemble_payload, ensemble_artifact_path)
+    manifest_rows.append({
+        "model": "Weighted Ensemble",
+        "series_id": "__global__",
+        "artifact_path": str(ensemble_artifact_path),
+        "status": "saved",
+        "rows_trained": int(len(ensemble_weights)),
+    })
+
+    manifest = pd.DataFrame(manifest_rows)
+    manifest.to_csv(artifacts_root / "artifact_manifest.csv", index=False)
+    return manifest
+
+
+def save_residual_distribution_plots(
+    frame,
+    prediction_pairs,
+    histogram_path,
+    qqplot_path,
+    title_prefix,
+):
+    residual_sets = []
+    for model_name, column in prediction_pairs:
+        valid = frame.loc[frame["actual"].notna() & frame[column].notna(), ["actual", column]].copy()
+        if len(valid) < 3:
+            continue
+        residuals = valid["actual"] - valid[column]
+        residual_sets.append((model_name, residuals))
+
+    if not residual_sets:
+        return
+
+    n = len(residual_sets)
+    fig_hist, axes_hist = plt.subplots(n, 1, figsize=(9, 3.2 * n), sharex=False)
+    if n == 1:
+        axes_hist = [axes_hist]
+
+    for ax, (model_name, residuals) in zip(axes_hist, residual_sets):
+        clean = pd.to_numeric(residuals, errors="coerce").dropna()
+        bins = min(20, max(8, int(np.sqrt(len(clean)))))
+        ax.hist(clean, bins=bins, color="#ad3f2f", alpha=0.8, edgecolor="white")
+        ax.axvline(0.0, color="#1e1b16", linestyle="--", linewidth=1.2)
+        ax.set_title(f"{title_prefix}: {model_name} residual histogram")
+        ax.set_xlabel("Residual")
+        ax.set_ylabel("Frequency")
+        ax.grid(axis="y", alpha=0.25)
+
+    fig_hist.tight_layout()
+    plt.savefig(histogram_path, dpi=200, bbox_inches="tight")
+    plt.close(fig_hist)
+
+    fig_qq, axes_qq = plt.subplots(n, 1, figsize=(9, 3.6 * n), sharex=False)
+    if n == 1:
+        axes_qq = [axes_qq]
+
+    for ax, (model_name, residuals) in zip(axes_qq, residual_sets):
+        clean = pd.to_numeric(residuals, errors="coerce").dropna()
+        qqplot(clean, line="45", ax=ax, markerfacecolor="#d77d35", markeredgecolor="#ad3f2f", alpha=0.75)
+        ax.set_title(f"{title_prefix}: {model_name} residual Q-Q plot")
+        ax.grid(alpha=0.25)
+
+    fig_qq.tight_layout()
+    plt.savefig(qqplot_path, dpi=200, bbox_inches="tight")
+    plt.close(fig_qq)
 
 def compute_series_diagnostics(frame, prediction_pairs):
     rows = []
