@@ -1,7 +1,10 @@
 import ast
 from contextlib import contextmanager
 from datetime import datetime
+import os
 from pathlib import Path
+import platform
+import sys
 
 import constants as const
 
@@ -52,6 +55,40 @@ INNER_FOLDS_ML = const.INNER_FOLDS_SARIMA
 LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
+
+def get_runtime_config(default_sarima_jobs=4):
+    cpu_total = os.cpu_count() or 1
+    system = platform.system()
+    machine = platform.machine().lower()
+    is_apple_silicon = system == "Darwin" and machine in {"arm64", "aarch64"}
+    in_notebook = "ipykernel" in sys.modules
+
+    reserve_cores = 2 if cpu_total >= 8 else 1
+    available_parallel_jobs = max(1, cpu_total - reserve_cores)
+
+    if is_apple_silicon:
+        sarima_n_jobs = max(int(default_sarima_jobs), available_parallel_jobs)
+        sklearn_n_jobs = max(1, min(6, available_parallel_jobs))
+        lightgbm_n_jobs = max(1, min(6, available_parallel_jobs))
+        use_parallel_sarima = True
+    else:
+        sarima_n_jobs = max(1, min(int(default_sarima_jobs), available_parallel_jobs))
+        sklearn_n_jobs = 1
+        lightgbm_n_jobs = 1
+        use_parallel_sarima = not (system == "Windows" and in_notebook)
+
+    return {
+        "system": system,
+        "machine": machine,
+        "cpu_total": cpu_total,
+        "is_apple_silicon": is_apple_silicon,
+        "in_notebook": in_notebook,
+        "sarima_n_jobs": sarima_n_jobs,
+        "sklearn_n_jobs": sklearn_n_jobs,
+        "lightgbm_n_jobs": lightgbm_n_jobs,
+        "use_parallel_sarima": use_parallel_sarima,
+    }
+
 
 def log_progress(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -806,25 +843,33 @@ def build_ml_tuning_frame(df, feature_cols, exog_cols=None):
     }
 
 
-def run_svr_models(manifest, panel, feature_cols):
+def run_svr_models(manifest, panel, feature_cols, cv_n_jobs=1):
     prediction_rows = []
     svr_settings_rows = []
+    total_series = int(len(manifest))
 
-    for _, meta in manifest.iterrows():
+    if total_series > 0:
+        log_progress(f"SVR series: started 0/{total_series}")
+
+    for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
+        label = series_label(meta)
         df = panel.loc[panel["series_id"] == meta["series_id"]].sort_values("month").reset_index(drop=True)
         prepared = build_ml_tuning_frame(df, feature_cols)
 
         if prepared is None:
+            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         test_positions = prepared["test_positions"]
         tuning = prepared["tuning"]
 
         if len(tuning) < MIN_TRAIN_OBS_ML:
+            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         n_splits = min(INNER_FOLDS_ML, max(2, len(tuning) - MIN_TRAIN_OBS_ML))
         if n_splits < 2:
+            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         time_cv = TimeSeriesSplit(n_splits=n_splits)
@@ -839,7 +884,7 @@ def run_svr_models(manifest, panel, feature_cols):
             param_grid=SVR_PARAM_GRID,
             scoring="neg_root_mean_squared_error",
             cv=time_cv,
-            n_jobs=1,
+            n_jobs=cv_n_jobs,
             refit=True,
         )
 
@@ -852,6 +897,7 @@ def run_svr_models(manifest, panel, feature_cols):
             best_params = grid.best_params_
             best_rmse = -float(grid.best_score_)
         except Exception:
+            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         svr_settings_rows.append({
@@ -921,6 +967,11 @@ def run_svr_models(manifest, panel, feature_cols):
                 "svr_pred": float(svr_pred),
             })
 
+        log_completed_task("SVR series", completed, total_series, label)
+
+    if total_series > 0:
+        log_progress(f"SVR series: finished {total_series}/{total_series}")
+
     return pd.DataFrame(prediction_rows), pd.DataFrame(svr_settings_rows)
 
 def fill_lightgbm_exog_from_history(train_block, row, exog_cols):
@@ -932,7 +983,7 @@ def fill_lightgbm_exog_from_history(train_block, row, exog_cols):
                 row[col] = float(last_known.iloc[-1])
     return row
 
-def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols):
+def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols, lightgbm_n_jobs=1):
     if not feature_cols:
         return None, float("inf")
 
@@ -963,7 +1014,7 @@ def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols):
                 objective="regression",
                 random_state=LIGHTGBM_RANDOM_STATE,
                 verbosity=-1,
-                n_jobs=1,
+                n_jobs=lightgbm_n_jobs,
                 force_col_wise=True,
                 max_bin=127,
                 **params,
@@ -986,30 +1037,42 @@ def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols):
     return study.best_params, float(study.best_value)
 
 
-def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
+def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_jobs=1):
     prediction_rows = []
     settings_rows = []
+    total_series = int(len(manifest))
 
-    for _, meta in manifest.iterrows():
+    if total_series > 0:
+        log_progress(f"LightGBM series: started 0/{total_series}")
+
+    for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
+        label = series_label(meta)
         df = panel.loc[panel["series_id"] == meta["series_id"]].sort_values("month").reset_index(drop=True)
         prepared = build_ml_tuning_frame(df, feature_cols, exog_cols=exog_cols)
 
         if prepared is None:
+            log_completed_task("LightGBM series", completed, total_series, label, status="skipped")
             continue
 
         test_positions = prepared["test_positions"]
         tuning = prepared["tuning"]
         inner_splits = prepared["inner_splits"]
 
-        best_params, best_rmse = tune_lightgbm_feature_set(tuning, inner_splits, feature_cols)
+        best_params, best_rmse = tune_lightgbm_feature_set(
+            tuning,
+            inner_splits,
+            feature_cols,
+            lightgbm_n_jobs=lightgbm_n_jobs,
+        )
         if best_params is None:
+            log_completed_task("LightGBM series", completed, total_series, label, status="skipped")
             continue
 
         feature_probe = lgb.LGBMRegressor(
             objective="regression",
             random_state=LIGHTGBM_RANDOM_STATE,
             verbosity=-1,
-            n_jobs=1,
+            n_jobs=lightgbm_n_jobs,
             force_col_wise=True,
             max_bin=127,
             **best_params,
@@ -1075,7 +1138,7 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
                         objective="regression",
                         random_state=LIGHTGBM_RANDOM_STATE,
                         verbosity=-1,
-                        n_jobs=1,
+                        n_jobs=lightgbm_n_jobs,
                         force_col_wise=True,
                         max_bin=127,
                         **best_params,
@@ -1097,6 +1160,11 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
                 "seasonal_naive_pred": float(seasonal_pred),
                 "lightgbm_pred": float(lightgbm_pred),
             })
+
+        log_completed_task("LightGBM series", completed, total_series, label)
+
+    if total_series > 0:
+        log_progress(f"LightGBM series: finished {total_series}/{total_series}")
 
     return pd.DataFrame(prediction_rows), pd.DataFrame(settings_rows)
 

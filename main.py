@@ -1,3 +1,14 @@
+import os
+import platform
+
+IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}
+if IS_APPLE_SILICON:
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import helper_functions as hf
 import constants as const
 
@@ -57,6 +68,11 @@ LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 
+RUNTIME_CONFIG = hf.get_runtime_config(SARIMA_N_JOBS)
+SARIMA_N_JOBS = RUNTIME_CONFIG["sarima_n_jobs"]
+SKLEARN_N_JOBS = RUNTIME_CONFIG["sklearn_n_jobs"]
+LIGHTGBM_N_JOBS = RUNTIME_CONFIG["lightgbm_n_jobs"]
+
 
 def print_table(title, df):
     print(f"\n=== {title} ===")
@@ -64,6 +80,13 @@ def print_table(title, df):
         print("(empty)")
         return
     print(df.to_string(index=False))
+
+hf.log_progress("Pipeline started")
+hf.log_progress(
+    f"Runtime config: system={RUNTIME_CONFIG['system']}, machine={RUNTIME_CONFIG['machine']}, "
+    f"cpu_total={RUNTIME_CONFIG['cpu_total']}, sarima_jobs={SARIMA_N_JOBS}, "
+    f"sklearn_jobs={SKLEARN_N_JOBS}, lightgbm_jobs={LIGHTGBM_N_JOBS}"
+)
 
 # 1. DATA PREPARATION AND PREPROCESS
 df_main = pd.read_csv("data/main/Combined Main Dataset.csv", low_memory=False)
@@ -116,6 +139,9 @@ macro_external_monthly = (
 macro_external_monthly = macro_external_monthly.dropna(subset=macro_external_monthly.columns.difference(["month"]))
 macro_external_monthly.to_html("tables/1.0.a Macro External Monthly.html")
 print("\n===DATASETS SUCCESSFULLY LOADED===\n")
+hf.log_progress(
+    f"1.0 Data preparation complete: {len(df_main):,} main rows, {len(macro_external_monthly):,} macro rows"
+)
 
 df_main.info()
 print()
@@ -269,6 +295,10 @@ global_shortlisted_driver_table = pd.DataFrame(
 granger_overview.to_html("tables/1.1.a Granger Causality Test Overview.html")
 global_driver_shortlist.to_html("tables/1.1.b Global Driver Shortlist.html")
 global_shortlisted_driver_table.to_html("tables/1.1.c Global Shortlisted Driver.html")
+hf.log_progress(
+    f"1.1 Granger causality complete: {len(granger_results_all):,} tests, "
+    f"{len(global_shortlisted_driver_lags):,} shortlisted drivers"
+)
 
 # 1.2. Filter Valid Entries
 valid_series = []
@@ -287,6 +317,10 @@ df_main_filtered = pd.concat(valid_series, ignore_index=True)
 df_main_filtered = df_main_filtered.sort_values(
     ["region", "commodity_name", "month"]
 ).reset_index(drop=True)
+hf.log_progress(
+    f"1.2 Valid series filtering complete: {df_main_filtered['region'].nunique():,} regions, "
+    f"{df_main_filtered['commodity_name'].nunique():,} commodities, {len(df_main_filtered):,} rows"
+)
 
 # 1.3. Feature Engineering
 df_main_filtered = df_main_filtered.merge(
@@ -392,6 +426,10 @@ evaluation_setup = pd.DataFrame(
 
 evaluation_setup.to_html("tables/1.3.c Evaluation Setup.html", index=False)
 split_readiness.to_html("tables/1.3.d Split Readiness.html", index=False)
+hf.log_progress(
+    f"1.3 Feature engineering complete: {eligible_panel['series_id'].nunique():,} eligible series, "
+    f"{len(eligible_panel):,} panel rows"
+)
 
 # SARIMA Benchmarking and Evaluation
 # Stationarity diagnostics
@@ -519,6 +557,10 @@ sarima_readiness_overview = pd.DataFrame([
 
 sarima_readiness_overview.to_html("tables/1.4.f SARIMA Readiness Overview.html", index=False)
 sarima_readiness.to_html("tables/1.4.g SARIMA Readiness.html", index=False)
+hf.log_progress(
+    f"1.4 Diagnostics complete: {len(stationarity_results):,} stationarity checks, "
+    f"{len(seasonality_results):,} seasonality checks, {len(sarima_readiness):,} SARIMA-ready rows"
+)
 
 # Visual 1: Series-length distribution
 fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -705,6 +747,9 @@ sarima_search_space = pd.DataFrame([
     }
 ])
 sarima_search_space.to_html("tables/2.1.a SARIMA Search Space.html", index=False)
+hf.log_progress(
+    f"2.1 SARIMA search space ready: {len(sarima_ready_manifest):,} series, {SARIMA_N_JOBS} workers"
+)
 
 series_lookup = {
     series_id: part.copy()
@@ -716,14 +761,19 @@ def run_one_sarima(meta_row, series_lookup):
     series_frame = series_lookup[meta_dict["series_id"]]
     return hf.run_sarima_for_series(meta_dict, series_frame)
 
-sarima_outputs = Parallel(
-    n_jobs=SARIMA_N_JOBS,
-    backend="loky",
-    verbose=10
-)(
-    delayed(run_one_sarima)(meta_row, series_lookup)
-    for _, meta_row in sarima_ready_manifest.iterrows()
-)
+if sarima_ready_manifest.empty:
+    sarima_outputs = []
+else:
+    with hf.joblib_progress("SARIMA series", total=len(sarima_ready_manifest)):
+        sarima_outputs = Parallel(
+            n_jobs=SARIMA_N_JOBS,
+            backend="loky",
+            batch_size=1,
+            verbose=0
+        )(
+            delayed(run_one_sarima)(meta_row, series_lookup)
+            for _, meta_row in sarima_ready_manifest.iterrows()
+        )
 
 sarima_results_rows = []
 sarima_settings_rows = []
@@ -748,6 +798,11 @@ sarima_run_overview.to_html("tables/2.1.b SARIMA Run Overview.html", index=False
 sarima_model_settings.to_html("tables/2.1.c SARIMA Model Settings.html", index=False)
 sarima_predictions.to_html("tables/2.1.d SARIMA Predictions.html", index=False)
 print_table("SARIMA Run Overview", sarima_run_overview)
+hf.log_progress(
+    f"2.1 SARIMA forecasting complete: "
+    f"{sarima_run_overview['series_modeled'].iloc[0] if not sarima_run_overview.empty else 0:,} series modeled, "
+    f"{sarima_run_overview['holdout_predictions'].iloc[0] if not sarima_run_overview.empty else 0:,} holdout predictions"
+)
 
 prediction_pairs = [
     ("Naive", "naive_pred"),
@@ -771,6 +826,7 @@ hf.save_residual_distribution_plots(
     "visuals/2.2.e Residual QQ Plots.png",
     "SARIMA Evaluation",
 )
+hf.log_progress("2.2 SARIMA evaluation outputs saved")
 
 # Visual 1: Benchmark comparison
 if not sarima_global_metrics.empty:
@@ -863,11 +919,16 @@ svr_feature_manifest = pd.DataFrame([
     }
 ])
 svr_feature_manifest.to_html("tables/3.1.a SVR Feature Manifest.html", index=False)
+hf.log_progress(
+    f"3.1 SVR setup ready: {len(non_linear_ready_manifest):,} candidate series, "
+    f"{len(SVR_BASE_FEATURES):,} features"
+)
 
 svr_predictions, svr_model_settings = hf.run_svr_models(
     non_linear_ready_manifest,
     eligible_panel,
     SVR_BASE_FEATURES,
+    cv_n_jobs=SKLEARN_N_JOBS,
 )
 
 non_linear_predictions = sarima_predictions.merge(
@@ -918,6 +979,9 @@ hf.save_residual_distribution_plots(
     "SVR Evaluation",
 )
 print_table("SVR Run Overview", svr_run_overview)
+hf.log_progress(
+    f"3.2 SVR complete: {len(svr_model_settings):,} models, {len(svr_predictions):,} prediction rows"
+)
 
 # Visual 1: Benchmark comparison
 if not svr_global_metrics.empty:
@@ -992,12 +1056,17 @@ lightgbm_feature_manifest = pd.DataFrame([
     }
 ])
 lightgbm_feature_manifest.to_html("tables/4.1.a LightGBM Feature Manifest.html", index=False)
+hf.log_progress(
+    f"4.1 LightGBM setup ready: {len(non_linear_ready_manifest):,} candidate series, "
+    f"{len(LIGHTGBM_FEATURES):,} features"
+)
 
 lightgbm_predictions, lightgbm_model_settings = hf.run_lightgbm_models(
     non_linear_ready_manifest,
     eligible_panel,
     LIGHTGBM_FEATURES,
     LIGHTGBM_EXOG_FEATURES,
+    lightgbm_n_jobs=LIGHTGBM_N_JOBS,
 )
 
 if lightgbm_predictions.empty:
@@ -1047,6 +1116,9 @@ hf.save_residual_distribution_plots(
     "LightGBM Evaluation",
 )
 print_table("LightGBM Run Overview", lightgbm_run_overview)
+hf.log_progress(
+    f"4.2 LightGBM complete: {len(lightgbm_model_settings):,} models, {len(lightgbm_predictions):,} prediction rows"
+)
 
 # Visual 1: LightGBM benchmark comparison
 if not lightgbm_global_metrics.empty:
@@ -1204,6 +1276,10 @@ artifact_export_overview = (
 )
 artifact_manifest.to_html("tables/5.1.i Artifact Manifest.html", index=False)
 artifact_export_overview.to_html("tables/5.1.j Artifact Export Overview.html", index=False)
+hf.log_progress(
+    f"5.1 Ensemble and artifacts complete: {len(artifact_manifest):,} artifact records, "
+    f"{len(ensemble_predictions):,} ensemble prediction rows"
+)
 
 # Visual 1: Ensemble benchmark comparison
 if not ensemble_global_metrics.empty:
@@ -1268,3 +1344,5 @@ if not ensemble_series_metrics.empty:
         fig.tight_layout()
         plt.savefig("visuals/5.2.b Best Ensemble Forecasts.png", dpi=200, bbox_inches="tight")
         plt.close()
+
+hf.log_progress("Pipeline finished")
