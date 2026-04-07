@@ -4,6 +4,7 @@ const state = {
   selectedRegion: null,
   selectedModel: "Weighted Ensemble",
   selectedView: "actual-vs-forecast",
+  exportUrl: null,
 };
 
 const elements = {
@@ -17,6 +18,10 @@ const elements = {
   targetLabel: document.getElementById("target-label"),
   forecastHorizon: document.getElementById("forecast-horizon"),
   generatedAt: document.getElementById("generated-at"),
+  uploadInput: document.getElementById("upload-input"),
+  uploadButton: document.getElementById("upload-button"),
+  uploadStatus: document.getElementById("upload-status"),
+  exportLink: document.getElementById("export-link"),
 };
 
 const fmtNumber = (value, digits = 2) => {
@@ -25,6 +30,14 @@ const fmtNumber = (value, digits = 2) => {
     minimumFractionDigits: digits,
     maximumFractionDigits: digits,
   });
+};
+
+const fmtPercent = (value, digits = 1) => {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return "N/A";
+  return `${(Number(value) * 100).toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}%`;
 };
 
 const fmtDate = (value) => {
@@ -71,6 +84,10 @@ function filterFuture(seriesId) {
   );
 }
 
+function getSeriesProfile(seriesId) {
+  return (state.data.series_profiles || []).find((row) => row.series_id === seriesId);
+}
+
 function buildSeriesSummary(historyRows, futureRows) {
   const firstMonth = historyRows[0]?.month;
   const lastActualMonth = historyRows[historyRows.length - 1]?.month;
@@ -84,92 +101,87 @@ function buildSeriesSummary(historyRows, futureRows) {
   `;
 }
 
+function applyPayloadResponse(response, statusMessage) {
+  state.data = response.payload;
+  state.exportUrl = response.export_url || null;
+
+  elements.targetLabel.textContent = state.data.target_label;
+  elements.forecastHorizon.textContent = `${state.data.forecast_horizon_months} months`;
+  elements.generatedAt.textContent = new Date(state.data.generated_at).toLocaleString();
+  elements.uploadStatus.textContent = statusMessage;
+
+  if (state.exportUrl) {
+    elements.exportLink.href = state.exportUrl;
+    elements.exportLink.classList.remove("hidden");
+  } else {
+    elements.exportLink.href = "#";
+    elements.exportLink.classList.add("hidden");
+  }
+
+  const commodities = uniqueSorted(state.data.series_options.map((row) => row.commodity_name));
+  state.selectedCommodity = commodities.includes(state.selectedCommodity) ? state.selectedCommodity : commodities[0];
+  state.selectedRegion = state.data.series_options.find(
+    (row) => row.commodity_name === state.selectedCommodity
+  )?.region || null;
+
+  setOptions(elements.commodity, commodities, state.selectedCommodity);
+  setOptions(elements.model, state.data.models, state.selectedModel);
+  render();
+}
+
 function buildMetricCards(seriesId) {
   const seriesMetric = state.data.series_metrics.find(
     (row) => row.series_id === seriesId && row.model === state.selectedModel
   );
-  const globalMetric = state.data.global_metrics.find((row) => row.model === state.selectedModel);
+  const seriesProfile = getSeriesProfile(seriesId);
 
-  const cards = [
-    { label: "Series RMSE", value: fmtNumber(seriesMetric?.rmse) },
-    { label: "Series MAE", value: fmtNumber(seriesMetric?.mae) },
-    { label: "Series R²", value: fmtNumber(seriesMetric?.r2) },
-    { label: "Series Holdout Rows", value: fmtNumber(seriesMetric?.rows_evaluated, 0) },
-    { label: "Global RMSE", value: fmtNumber(globalMetric?.rmse) },
-    { label: "Global MAE", value: fmtNumber(globalMetric?.mae) },
-    { label: "Global R²", value: fmtNumber(globalMetric?.r2) },
-    { label: "Global Holdout Rows", value: fmtNumber(globalMetric?.rows_evaluated, 0) },
-  ];
-
-  elements.metrics.innerHTML = cards
-    .map(
-      (card) => `
-        <article class="metric-card">
-          <span class="metric-label">${card.label}</span>
-          <strong class="metric-value">${card.value}</strong>
-        </article>
-      `
-    )
-    .join("");
-}
-
-function buildMetricCardsEnhanced(seriesId) {
-  const seriesMetric = state.data.series_metrics.find(
-    (row) => row.series_id === seriesId && row.model === state.selectedModel
-  );
-  const globalMetric = state.data.global_metrics.find((row) => row.model === state.selectedModel);
-  const consistencyMetric = (state.data.model_consistency_summary || []).find(
-    (row) => row.model === state.selectedModel
-  );
-
-  const sections = [
+  const metricSections = [
     {
-      title: "Series-Level Performance",
-      subtitle: "Use this to compare the selected commodity-region series across models.",
+      title: `${state.selectedModel} Holdout Metrics`,
+      subtitle: "Series-level holdout evaluation for the selected model.",
       cards: [
-        { label: "Series RMSE", value: fmtNumber(seriesMetric?.rmse) },
-        { label: "Series MAE", value: fmtNumber(seriesMetric?.mae) },
-        { label: "Series R2", value: fmtNumber(seriesMetric?.r2) },
-        { label: "Series NRMSE", value: fmtNumber(seriesMetric?.nrmse_range) },
-        { label: "Series NMAE", value: fmtNumber(seriesMetric?.nmae_range) },
-        { label: "Series YoY Range", value: fmtNumber(seriesMetric?.holdout_actual_range_yoy) },
-        { label: "Series Holdout Rows", value: fmtNumber(seriesMetric?.rows_evaluated, 0) },
+        { label: "Holdout RMSE", value: fmtNumber(seriesMetric?.rmse) },
+        { label: "Holdout MAE", value: fmtNumber(seriesMetric?.mae) },
+        { label: "Holdout R2", value: fmtNumber(seriesMetric?.r2) },
       ],
     },
     {
-      title: "Overall Performance",
-      subtitle: "Primary pooled holdout metrics for selecting the best overall model.",
+      title: "Model Inner RMSE",
+      subtitle: "Validation error used to derive the ensemble weighting.",
       cards: [
-        { label: "Global RMSE", value: fmtNumber(globalMetric?.rmse) },
-        { label: "Global MAE", value: fmtNumber(globalMetric?.mae) },
-        { label: "Global R2", value: fmtNumber(globalMetric?.r2) },
-        { label: "Global Holdout Rows", value: fmtNumber(globalMetric?.rows_evaluated, 0) },
-        { label: "Mean Series NRMSE", value: fmtNumber(consistencyMetric?.mean_series_nrmse) },
-        { label: "Median Series NRMSE", value: fmtNumber(consistencyMetric?.median_series_nrmse) },
-        { label: "Best-Series Wins", value: fmtNumber(consistencyMetric?.best_series_wins, 0) },
+        { label: "SARIMA Inner RMSE", value: fmtNumber(seriesProfile?.sarima_inner_rmse, 3) },
+        { label: "SVR Inner RMSE", value: fmtNumber(seriesProfile?.svr_inner_rmse, 3) },
+        { label: "LightGBM Inner RMSE", value: fmtNumber(seriesProfile?.lightgbm_inner_rmse, 3) },
+      ],
+    },
+    {
+      title: "Holdout Ensemble Weights",
+      subtitle: `Interpretable weight distribution for this series. Dominant: ${seriesProfile?.dominant_ensemble_model || "N/A"}.`,
+      cards: [
+        { label: "SARIMA Weight", value: fmtPercent(seriesProfile?.sarima_weight) },
+        { label: "SVR Weight", value: fmtPercent(seriesProfile?.svr_weight) },
+        { label: "LightGBM Weight", value: fmtPercent(seriesProfile?.lightgbm_weight) },
       ],
     },
   ];
 
-  elements.metrics.innerHTML = sections
+  elements.metrics.innerHTML = metricSections
     .map(
       (section) => `
         <section class="metric-section">
-          <header class="metric-section-header">
+          <div class="metric-section-header">
             <h3>${section.title}</h3>
             <p>${section.subtitle}</p>
-          </header>
+          </div>
           <div class="metric-section-grid">
-            ${section.cards
-              .map(
-                (card) => `
-                  <article class="metric-card">
-                    <span class="metric-label">${card.label}</span>
-                    <strong class="metric-value">${card.value}</strong>
-                  </article>
-                `
-              )
-              .join("")}
+            ${section.cards.map(
+              (card) => `
+                <article class="metric-card">
+                  <span class="metric-label">${card.label}</span>
+                  <strong class="metric-value">${card.value}</strong>
+                </article>
+              `
+            ).join("")}
           </div>
         </section>
       `
@@ -239,7 +251,7 @@ function renderChart(seriesId) {
   const holdoutRows = filterHoldout(seriesId);
   const futureRows = filterFuture(seriesId);
   buildSeriesSummary(historyRows, futureRows);
-  buildMetricCardsEnhanced(seriesId);
+  buildMetricCards(seriesId);
   setPointDetails(null);
 
   const traces = [];
@@ -404,21 +416,21 @@ function render() {
 }
 
 async function init() {
-  const response = await fetch("data/dashboard.json");
-  state.data = await response.json();
+  let payload;
+  try {
+    const response = await fetch("/api/dashboard");
+    if (!response.ok) {
+      throw new Error("API dashboard endpoint unavailable.");
+    }
+    payload = await response.json();
+  } catch (error) {
+    const fallbackResponse = await fetch("data/dashboard.json");
+    const fallbackPayload = await fallbackResponse.json();
+    payload = { payload: fallbackPayload, export_url: null };
+    elements.uploadStatus.textContent = "Loaded static dashboard data. Upload requires the local Python server.";
+  }
 
-  elements.targetLabel.textContent = state.data.target_label;
-  elements.forecastHorizon.textContent = `${state.data.forecast_horizon_months} months`;
-  elements.generatedAt.textContent = new Date(state.data.generated_at).toLocaleString();
-
-  const commodities = uniqueSorted(state.data.series_options.map((row) => row.commodity_name));
-  state.selectedCommodity = commodities[0];
-  state.selectedRegion = state.data.series_options.find(
-    (row) => row.commodity_name === state.selectedCommodity
-  )?.region || null;
-
-  setOptions(elements.commodity, commodities, state.selectedCommodity);
-  setOptions(elements.model, state.data.models, state.selectedModel);
+  applyPayloadResponse(payload, elements.uploadStatus.textContent || "Using default exported dashboard data.");
 
   elements.commodity.addEventListener("change", (event) => {
     state.selectedCommodity = event.target.value;
@@ -440,7 +452,35 @@ async function init() {
     render();
   });
 
-  render();
+  elements.uploadButton.addEventListener("click", async () => {
+    const file = elements.uploadInput.files[0];
+    if (!file) {
+      elements.uploadStatus.textContent = "Select a CSV file first.";
+      return;
+    }
+
+    elements.uploadStatus.textContent = `Processing ${file.name}...`;
+
+    try {
+      const csvText = await file.text();
+      const uploadResponse = await fetch("/api/upload-csv", {
+        method: "POST",
+        headers: {
+          "Content-Type": "text/csv; charset=utf-8",
+        },
+        body: csvText,
+      });
+      const uploadPayload = await uploadResponse.json();
+
+      if (!uploadResponse.ok) {
+        throw new Error(uploadPayload.error || "Upload failed.");
+      }
+
+      applyPayloadResponse(uploadPayload, `Showing results for ${file.name}.`);
+    } catch (error) {
+      elements.uploadStatus.textContent = error.message || "Upload failed.";
+    }
+  });
 }
 
 init().catch((error) => {

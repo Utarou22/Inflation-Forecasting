@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -8,29 +8,35 @@
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 </head>
 <body>
-  <main class="layout">
-    <section class="hero">
+  <main class="page">
+    <section class="topbar">
       <div>
-        <p class="eyebrow">Commodity Forecast Web App</p>
-        <h1>Actual, forecast, and click-through diagnostics in one view.</h1>
+        <p class="eyebrow">Forecast Dashboard</p>
+        <h1>Model review for default and uploaded datasets.</h1>
       </div>
-      <div class="hero-meta">
-        <div class="meta-card">
-          <span class="meta-label">Target</span>
-          <strong id="target-label">Loading...</strong>
-        </div>
-        <div class="meta-card">
-          <span class="meta-label">Forecast Horizon</span>
-          <strong id="forecast-horizon">-</strong>
-        </div>
-        <div class="meta-card">
-          <span class="meta-label">Generated</span>
-          <strong id="generated-at">-</strong>
-        </div>
+      <div class="meta-inline">
+        <span><strong id="target-label">Loading...</strong></span>
+        <span>Horizon: <strong id="forecast-horizon">-</strong></span>
+        <span>Generated: <strong id="generated-at">-</strong></span>
       </div>
     </section>
 
-    <section class="controls">
+    <section class="panel upload-panel">
+      <div class="panel-row">
+        <div>
+          <h2>Dataset Input</h2>
+          <p>Upload a CSV with the same schema as the main dataset to rebuild holdout and forecast outputs from the saved artifacts.</p>
+        </div>
+        <div class="upload-actions">
+          <input id="upload-input" type="file" accept=".csv" />
+          <button id="upload-button" type="button">Run On CSV</button>
+          <a id="export-link" class="button-link hidden" href="#" download>Download Results CSV</a>
+        </div>
+      </div>
+      <p id="upload-status" class="status-text">Using default exported dashboard data.</p>
+    </section>
+
+    <section class="panel filters-panel">
       <label>
         <span>Commodity</span>
         <select id="commodity-select"></select>
@@ -53,29 +59,29 @@
       </label>
     </section>
 
-    <section class="summary" id="series-summary"></section>
+    <section class="panel summary-panel" id="series-summary"></section>
 
     <section class="content-grid">
-      <div class="chart-card">
-        <div class="card-header">
+      <div class="panel chart-panel">
+        <div class="section-header">
           <h2>Interactive Price View</h2>
-          <p>Hover to inspect price and YoY. Click a plotted point for detailed diagnostics.</p>
+          <p>Click a point to inspect actuals, forecasts, and errors.</p>
         </div>
         <div id="chart"></div>
       </div>
 
-      <aside class="sidebar">
+      <aside class="side-column">
         <div class="panel">
-          <div class="card-header">
+          <div class="section-header">
             <h2>Metrics</h2>
-            <p>Series-level diagnostics support cross-series comparison, while overall pooled metrics remain the primary ranking basis.</p>
+            <p>Holdout metrics for the selected model and inner RMSE values for this series.</p>
           </div>
           <div class="metrics-grid" id="metrics-grid"></div>
         </div>
         <div class="panel">
-          <div class="card-header">
+          <div class="section-header">
             <h2>Point Diagnostics</h2>
-            <p>Click a historical, holdout, or forecast point to inspect the row-level values.</p>
+            <p>Point-level details for the clicked mark.</p>
           </div>
           <div class="detail-list empty-state" id="point-details">Click a point to inspect it.</div>
         </div>
@@ -86,3 +92,4 @@
   <script src="app.js"></script>
 </body>
 </html>
+

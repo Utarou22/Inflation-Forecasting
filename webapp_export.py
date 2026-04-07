@@ -1,14 +1,16 @@
 import ast
+from io import StringIO
 import json
 from html.parser import HTMLParser
 from pathlib import Path
 import warnings
 
+import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.svm import SVR
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
@@ -18,6 +20,7 @@ import helper_functions as hf
 
 ROOT = Path(__file__).resolve().parent
 TABLES_DIR = ROOT / "tables"
+ARTIFACTS_DIR = ROOT / "artifacts"
 WEBAPP_DATA_DIR = ROOT / "webapp" / "data"
 WEBAPP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -25,6 +28,7 @@ TARGET_COL = const.TARGET_COL
 TARGET_LABEL = const.TARGET_LABEL
 MIN_TRAIN_OBS_SARIMA = const.MIN_TRAIN_OBS_SARIMA
 MIN_TRAIN_OBS_ML = const.MIN_TRAIN_OBS_ML
+HOLDOUT_RATIO = const.HOLDOUT_RATIO
 SARIMA_MAXITER = const.SARIMA_MAXITER
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 MODEL_SERIES_CAP = const.MODEL_SERIES_CAP
@@ -124,8 +128,46 @@ def load_html_table(path):
     return normalize_table(df)
 
 
-def prepare_base_panel():
-    df_main = pd.read_csv(ROOT / "data" / "main" / "Combined Main Dataset.csv", low_memory=False)
+def load_artifact_payloads(model_name, artifact_subdir):
+    manifest = pd.read_csv(ARTIFACTS_DIR / "artifact_manifest.csv")
+    rows = manifest.loc[
+        (manifest["model"] == model_name) & (manifest["status"] == "saved")
+    ].copy()
+
+    payloads = {}
+    for _, row in rows.iterrows():
+        artifact_path = Path(row["artifact_path"])
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            payload = joblib.load(artifact_path)
+        payloads[payload["series_id"]] = payload
+
+    return payloads
+
+
+def load_ensemble_weight_lookup():
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        payload = joblib.load(ARTIFACTS_DIR / "weighted_ensemble" / "ensemble_weights.joblib")
+
+    weights = payload["weights"].copy()
+    return {row["series_id"]: row.to_dict() for _, row in weights.iterrows()}
+
+
+def validate_main_dataset(df_main):
+    required_columns = {"region", "commodity_name", "month", "price"}
+    missing = sorted(required_columns.difference(df_main.columns))
+    if missing:
+        raise ValueError(f"Dataset is missing required columns: {', '.join(missing)}")
+
+
+def prepare_base_panel(main_df=None):
+    if main_df is None:
+        df_main = pd.read_csv(ROOT / "data" / "main" / "Combined Main Dataset.csv", low_memory=False)
+    else:
+        df_main = main_df.copy()
+
+    validate_main_dataset(df_main)
     df_main["month"] = pd.to_datetime(df_main["month"], errors="coerce")
     df_main["price"] = pd.to_numeric(df_main["price"], errors="coerce")
 
@@ -203,6 +245,9 @@ def prepare_base_panel():
             interpolated["commodity_name"] = commodity_name
             valid_series.append(interpolated)
 
+    if not valid_series:
+        raise ValueError("No valid series remained after interpolation and minimum-length filtering.")
+
     df_main_filtered = pd.concat(valid_series, ignore_index=True)
     df_main_filtered = df_main_filtered.sort_values(["region", "commodity_name", "month"]).reset_index(drop=True)
 
@@ -271,8 +316,12 @@ def extend_series_for_future(series_df, driver_cols=None):
 
 def forecast_sarima_future(series_df, settings_row, horizon):
     order = parse_literal(settings_row.get("sarima_order"), fallback=None)
+    if order is None:
+        order = settings_row.get("order")
     seasonal_order = parse_literal(settings_row.get("sarima_seasonal_order"), fallback=None)
-    trend = settings_row.get("sarima_trend", "n")
+    if seasonal_order is None:
+        seasonal_order = settings_row.get("seasonal_order")
+    trend = settings_row.get("sarima_trend", settings_row.get("trend", "n"))
     if order is None or seasonal_order is None:
         return pd.DataFrame()
 
@@ -324,6 +373,8 @@ def forecast_sarima_future(series_df, settings_row, horizon):
 
 def forecast_svr_future(series_df, settings_row, feature_cols, horizon):
     best_params = parse_literal(settings_row.get("svr_best_params"), fallback={}) or {}
+    if not best_params:
+        best_params = settings_row.get("best_params", {}) or {}
     featured_history = hf.add_basic_price_features(series_df)
     model_train = featured_history.loc[
         featured_history[feature_cols + [TARGET_COL]].notna().all(axis=1),
@@ -334,7 +385,7 @@ def forecast_svr_future(series_df, settings_row, feature_cols, horizon):
 
     try:
         model = Pipeline([
-            ("scaler", MinMaxScaler()),
+            ("scaler", RobustScaler()),
             ("svr", SVR(
                 kernel="rbf",
                 C=best_params.get("svr__C", 1.0),
@@ -381,6 +432,8 @@ def forecast_svr_future(series_df, settings_row, feature_cols, horizon):
 
 def forecast_lightgbm_future(series_df, settings_row, feature_cols, exog_cols, horizon):
     best_params = parse_literal(settings_row.get("lightgbm_params"), fallback={}) or {}
+    if not best_params:
+        best_params = settings_row.get("best_params", {}) or {}
     featured_history = hf.add_basic_price_features(series_df)
     featured_history, _ = hf.add_exogenous_lags(featured_history, drivers=EXOG_DRIVER_COLUMNS)
 
@@ -445,10 +498,306 @@ def forecast_lightgbm_future(series_df, settings_row, feature_cols, exog_cols, h
     return pd.DataFrame(rows)
 
 
+def get_holdout_positions(df, min_train_obs):
+    valid_positions = df.index[df[TARGET_COL].notna()].tolist()
+    if len(valid_positions) < min_train_obs + 1:
+        return []
+
+    holdout_count = max(1, int(np.ceil(len(valid_positions) * HOLDOUT_RATIO)))
+    holdout_count = min(holdout_count, len(valid_positions) - min_train_obs)
+    if holdout_count <= 0:
+        return []
+
+    return valid_positions[-holdout_count:]
+
+
+def generate_sarima_holdout(series_df, settings_row):
+    order = parse_literal(settings_row.get("sarima_order"), fallback=None)
+    if order is None:
+        order = settings_row.get("order")
+    seasonal_order = parse_literal(settings_row.get("sarima_seasonal_order"), fallback=None)
+    if seasonal_order is None:
+        seasonal_order = settings_row.get("seasonal_order")
+    trend = settings_row.get("sarima_trend", settings_row.get("trend", "n"))
+    if order is None or seasonal_order is None:
+        return pd.DataFrame()
+
+    df = series_df.sort_values("month").reset_index(drop=True).copy()
+    test_positions = get_holdout_positions(df, MIN_TRAIN_OBS_SARIMA)
+    if not test_positions:
+        return pd.DataFrame()
+
+    prediction_rows = []
+    for holdout_position in test_positions:
+        train_block = df.iloc[:holdout_position].copy()
+        row = df.iloc[holdout_position].copy()
+        actual = row[TARGET_COL]
+
+        if pd.isna(actual):
+            continue
+
+        tuning_history = train_block.loc[train_block[TARGET_COL].notna(), ["month", TARGET_COL]].copy().reset_index(drop=True)
+        if tuning_history.empty:
+            continue
+
+        naive_pred = float(tuning_history[TARGET_COL].iloc[-1])
+        seasonal_pred = hf.seasonal_naive_forecast(tuning_history, row["month"], TARGET_COL)
+        if pd.isna(seasonal_pred):
+            seasonal_pred = naive_pred
+
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sarima_fit = SARIMAX(
+                    tuning_history[TARGET_COL],
+                    order=tuple(order),
+                    seasonal_order=tuple(seasonal_order),
+                    trend=trend,
+                    enforce_stationarity=True,
+                    enforce_invertibility=True,
+                ).fit(disp=False, maxiter=SARIMA_MAXITER)
+
+            sarima_pred = float(np.asarray(sarima_fit.forecast(steps=1))[0])
+            if not np.isfinite(sarima_pred) or abs(sarima_pred) > 1e6:
+                sarima_pred = naive_pred
+        except Exception:
+            sarima_pred = naive_pred
+
+        prediction_rows.append({
+            "series_id": settings_row["series_id"],
+            "region": settings_row["region"],
+            "commodity_name": settings_row["commodity_name"],
+            "month": row["month"],
+            "actual": float(actual),
+            "naive_pred": float(naive_pred),
+            "seasonal_naive_pred": float(seasonal_pred),
+            "sarima_pred": float(sarima_pred),
+        })
+
+    return pd.DataFrame(prediction_rows)
+
+
+def generate_svr_holdout(series_df, settings_row):
+    feature_cols = settings_row.get("feature_columns", []) or []
+    best_params = settings_row.get("best_params", {}) or {}
+    if not feature_cols:
+        return pd.DataFrame()
+
+    df = series_df.sort_values("month").reset_index(drop=True).copy()
+    test_positions = get_holdout_positions(df, MIN_TRAIN_OBS_ML)
+    if not test_positions:
+        return pd.DataFrame()
+
+    prediction_rows = []
+    for holdout_position in test_positions:
+        train_block = df.iloc[:holdout_position].copy()
+        row = df.iloc[holdout_position].copy()
+        actual = row[TARGET_COL]
+        if pd.isna(actual):
+            continue
+
+        history = train_block.loc[train_block[TARGET_COL].notna(), ["month", TARGET_COL]].copy().reset_index(drop=True)
+        if history.empty:
+            continue
+
+        naive_pred = float(history[TARGET_COL].iloc[-1])
+        seasonal_pred = hf.seasonal_naive_forecast(history, row["month"], TARGET_COL)
+        if pd.isna(seasonal_pred):
+            seasonal_pred = naive_pred
+
+        model_train = train_block.loc[
+            train_block[feature_cols + [TARGET_COL]].notna().all(axis=1),
+            feature_cols + [TARGET_COL],
+        ].copy()
+        feature_ready = bool(feature_cols) and row[feature_cols].notna().all()
+
+        if len(model_train) >= MIN_TRAIN_OBS_ML and feature_ready:
+            try:
+                final_model = Pipeline([
+                    ("scaler", RobustScaler()),
+                    ("svr", SVR(
+                        kernel="rbf",
+                        C=best_params.get("svr__C", 1.0),
+                        epsilon=best_params.get("svr__epsilon", 0.1),
+                        gamma=best_params.get("svr__gamma", "scale"),
+                    )),
+                ])
+                final_model.fit(model_train[feature_cols], model_train[TARGET_COL])
+                svr_pred = float(final_model.predict(pd.DataFrame([row[feature_cols].values], columns=feature_cols))[0])
+            except Exception:
+                svr_pred = naive_pred
+        else:
+            svr_pred = naive_pred
+
+        prediction_rows.append({
+            "series_id": settings_row["series_id"],
+            "region": settings_row["region"],
+            "commodity_name": settings_row["commodity_name"],
+            "month": row["month"],
+            "actual": float(actual),
+            "naive_pred": float(naive_pred),
+            "seasonal_naive_pred": float(seasonal_pred),
+            "svr_pred": float(svr_pred),
+        })
+
+    return pd.DataFrame(prediction_rows)
+
+
+def generate_lightgbm_holdout(series_df, settings_row):
+    feature_cols = settings_row.get("feature_columns", []) or []
+    exog_cols = settings_row.get("exogenous_feature_columns", []) or []
+    best_params = settings_row.get("best_params", {}) or {}
+    if not feature_cols:
+        return pd.DataFrame()
+
+    df = series_df.sort_values("month").reset_index(drop=True).copy()
+    test_positions = get_holdout_positions(df, MIN_TRAIN_OBS_ML)
+    if not test_positions:
+        return pd.DataFrame()
+
+    prediction_rows = []
+    for holdout_position in test_positions:
+        train_block = df.iloc[:holdout_position].copy()
+        row = df.iloc[holdout_position].copy()
+        actual = row[TARGET_COL]
+        if pd.isna(actual):
+            continue
+
+        history = train_block.loc[train_block[TARGET_COL].notna(), ["month", TARGET_COL]].copy().reset_index(drop=True)
+        if history.empty:
+            continue
+
+        naive_pred = float(history[TARGET_COL].iloc[-1])
+        seasonal_pred = hf.seasonal_naive_forecast(history, row["month"], TARGET_COL)
+        if pd.isna(seasonal_pred):
+            seasonal_pred = naive_pred
+
+        model_train = train_block.copy()
+        for col in exog_cols:
+            if col in model_train.columns:
+                model_train[col] = model_train[col].ffill().bfill()
+
+        model_train = model_train.loc[
+            model_train[feature_cols + [TARGET_COL]].notna().all(axis=1),
+            feature_cols + [TARGET_COL],
+        ].copy()
+        feature_ready = bool(feature_cols) and row[feature_cols].notna().all()
+
+        if len(model_train) >= MIN_TRAIN_OBS_ML and feature_ready:
+            try:
+                model = lgb.LGBMRegressor(
+                    objective="regression",
+                    random_state=LIGHTGBM_RANDOM_STATE,
+                    verbosity=-1,
+                    n_jobs=1,
+                    force_col_wise=True,
+                    max_bin=127,
+                    **best_params,
+                )
+                model.fit(model_train[feature_cols], model_train[TARGET_COL])
+                lightgbm_pred = float(model.predict(pd.DataFrame([row[feature_cols].values], columns=feature_cols))[0])
+            except Exception:
+                lightgbm_pred = naive_pred
+        else:
+            lightgbm_pred = naive_pred
+
+        prediction_rows.append({
+            "series_id": settings_row["series_id"],
+            "region": settings_row["region"],
+            "commodity_name": settings_row["commodity_name"],
+            "month": row["month"],
+            "actual": float(actual),
+            "naive_pred": float(naive_pred),
+            "seasonal_naive_pred": float(seasonal_pred),
+            "lightgbm_pred": float(lightgbm_pred),
+        })
+
+    return pd.DataFrame(prediction_rows)
+
+
 def inverse_rmse_weight(value):
     if pd.isna(value) or not np.isfinite(value) or value <= 0:
         return 0.0
     return 1.0 / float(value)
+
+
+def normalize_ensemble_components(weight_row):
+    raw_weights = {
+        "SARIMA": inverse_rmse_weight(weight_row.get("sarima_inner_rmse")),
+        "SVR": inverse_rmse_weight(weight_row.get("svr_inner_rmse")),
+        "LightGBM": inverse_rmse_weight(weight_row.get("lightgbm_inner_rmse")),
+    }
+    positive_total = sum(
+        weight for weight in raw_weights.values()
+        if np.isfinite(weight) and weight > 0
+    )
+    normalized_weights = {model_name: np.nan for model_name in raw_weights}
+
+    if positive_total > 0:
+        for model_name, raw_weight in raw_weights.items():
+            if np.isfinite(raw_weight) and raw_weight > 0:
+                normalized_weights[model_name] = raw_weight / positive_total
+
+    ranked_models = [
+        (model_name, normalized_weights[model_name])
+        for model_name in ["SARIMA", "SVR", "LightGBM"]
+        if pd.notna(normalized_weights[model_name])
+    ]
+    ranked_models.sort(key=lambda item: (-item[1], item[0]))
+    dominant_model = ranked_models[0][0] if ranked_models else None
+    dominant_weight = ranked_models[0][1] if ranked_models else np.nan
+
+    return {
+        "sarima_weight": normalized_weights["SARIMA"],
+        "svr_weight": normalized_weights["SVR"],
+        "lightgbm_weight": normalized_weights["LightGBM"],
+        "dominant_ensemble_model": dominant_model,
+        "dominant_ensemble_weight": dominant_weight,
+    }
+
+
+def build_series_profiles(series_options, series_metrics_export, ensemble_weight_lookup):
+    profiles = (
+        series_options[["series_id", "region", "commodity_name"]]
+        .drop_duplicates()
+        .copy()
+    )
+
+    if not series_metrics_export.empty:
+        best_holdout = (
+            series_metrics_export.sort_values(["series_id", "rmse", "model"])
+            .groupby("series_id", as_index=False)
+            .first()[["series_id", "model", "rmse"]]
+            .rename(columns={
+                "model": "best_holdout_model",
+                "rmse": "best_holdout_rmse",
+            })
+        )
+        profiles = profiles.merge(best_holdout, on="series_id", how="left")
+    else:
+        profiles["best_holdout_model"] = None
+        profiles["best_holdout_rmse"] = np.nan
+
+    weight_rows = []
+    for series_id in profiles["series_id"]:
+        weight_row = ensemble_weight_lookup.get(series_id, {})
+        normalized = normalize_ensemble_components(weight_row)
+        weight_rows.append({
+            "series_id": series_id,
+            "sarima_inner_rmse": weight_row.get("sarima_inner_rmse"),
+            "svr_inner_rmse": weight_row.get("svr_inner_rmse"),
+            "lightgbm_inner_rmse": weight_row.get("lightgbm_inner_rmse"),
+            "sarima_weight": normalized["sarima_weight"],
+            "svr_weight": normalized["svr_weight"],
+            "lightgbm_weight": normalized["lightgbm_weight"],
+            "dominant_ensemble_model": normalized["dominant_ensemble_model"],
+            "dominant_ensemble_weight": normalized["dominant_ensemble_weight"],
+        })
+
+    if weight_rows:
+        profiles = profiles.merge(pd.DataFrame(weight_rows), on="series_id", how="left")
+
+    return profiles.sort_values(["commodity_name", "region"]).reset_index(drop=True)
 
 
 def compute_series_normalized_metrics(holdout_frame):
@@ -519,22 +868,83 @@ def compute_model_consistency_summary(series_metrics_frame):
     return summary
 
 
-def main():
-    eligible_panel, eligible_series_manifest, regional_exogenous_feature_columns = prepare_base_panel()
+def build_dashboard_payload(main_df=None):
+    eligible_panel, eligible_series_manifest, regional_exogenous_feature_columns = prepare_base_panel(main_df=main_df)
 
-    sarima_model_settings = load_html_table(TABLES_DIR / "2.1.c SARIMA Model Settings.html")
-    svr_model_settings = load_html_table(TABLES_DIR / "3.1.c SVR Model Settings.html")
-    lightgbm_model_settings = load_html_table(TABLES_DIR / "4.1.c LightGBM Model Settings.html")
-    ensemble_predictions = load_html_table(TABLES_DIR / "5.1.c Ensemble Predictions.html")
-    ensemble_series_metrics = load_html_table(TABLES_DIR / "5.1.e Ensemble Series Metrics.html")
-    ensemble_global_metrics = load_html_table(TABLES_DIR / "5.1.d Ensemble Global Metrics.html")
+    sarima_settings_lookup = load_artifact_payloads("SARIMA", "sarima")
+    svr_settings_lookup = load_artifact_payloads("SVR", "svr")
+    lightgbm_settings_lookup = load_artifact_payloads("LightGBM", "lightgbm")
+    ensemble_weight_lookup = load_ensemble_weight_lookup()
 
-    holdout_base = ensemble_predictions.merge(
-        eligible_panel[["series_id", "month", "price", "price_lag_12"]],
-        on=["series_id", "month"],
-        how="left",
+    sarima_parts = []
+    svr_parts = []
+    lightgbm_parts = []
+
+    for series_id, part in eligible_panel.groupby("series_id"):
+        part = part.sort_values("month").reset_index(drop=True).copy()
+
+        if series_id in sarima_settings_lookup:
+            sarima_part = generate_sarima_holdout(part, sarima_settings_lookup[series_id])
+            if not sarima_part.empty:
+                sarima_parts.append(sarima_part)
+
+        if series_id in svr_settings_lookup:
+            svr_part = generate_svr_holdout(part, svr_settings_lookup[series_id])
+            if not svr_part.empty:
+                svr_parts.append(svr_part)
+
+        if series_id in lightgbm_settings_lookup:
+            lightgbm_part = generate_lightgbm_holdout(part, lightgbm_settings_lookup[series_id])
+            if not lightgbm_part.empty:
+                lightgbm_parts.append(lightgbm_part)
+
+    sarima_predictions = pd.concat(sarima_parts, ignore_index=True) if sarima_parts else pd.DataFrame(
+        columns=["series_id", "region", "commodity_name", "month", "actual", "naive_pred", "seasonal_naive_pred", "sarima_pred"]
     )
-    holdout_base["month"] = pd.to_datetime(holdout_base["month"], errors="coerce")
+    svr_predictions = pd.concat(svr_parts, ignore_index=True) if svr_parts else pd.DataFrame(
+        columns=["series_id", "region", "commodity_name", "month", "actual", "naive_pred", "seasonal_naive_pred", "svr_pred"]
+    )
+    lightgbm_predictions = pd.concat(lightgbm_parts, ignore_index=True) if lightgbm_parts else pd.DataFrame(
+        columns=["series_id", "region", "commodity_name", "month", "actual", "naive_pred", "seasonal_naive_pred", "lightgbm_pred"]
+    )
+
+    ensemble_predictions = sarima_predictions.merge(
+        svr_predictions[["series_id", "region", "commodity_name", "month", "svr_pred"]],
+        on=["series_id", "region", "commodity_name", "month"],
+        how="inner",
+    ).merge(
+        lightgbm_predictions[["series_id", "region", "commodity_name", "month", "lightgbm_pred"]],
+        on=["series_id", "region", "commodity_name", "month"],
+        how="inner",
+    )
+
+    if not ensemble_predictions.empty:
+        weights_frame = pd.DataFrame(list(ensemble_weight_lookup.values()))
+        ensemble_predictions = ensemble_predictions.merge(weights_frame, on="series_id", how="left")
+
+        weighted_preds = []
+        for _, row in ensemble_predictions.iterrows():
+            preds = np.asarray([row["sarima_pred"], row["svr_pred"], row["lightgbm_pred"]], dtype=float)
+            weights = np.asarray(
+                [
+                    inverse_rmse_weight(row.get("sarima_inner_rmse")),
+                    inverse_rmse_weight(row.get("svr_inner_rmse")),
+                    inverse_rmse_weight(row.get("lightgbm_inner_rmse")),
+                ],
+                dtype=float,
+            )
+
+            valid_weighted = np.isfinite(preds) & (weights > 0)
+            valid_any = np.isfinite(preds)
+
+            if valid_weighted.any():
+                weighted_preds.append(float(np.average(preds[valid_weighted], weights=weights[valid_weighted])))
+            elif valid_any.any():
+                weighted_preds.append(float(np.nanmean(preds[valid_any])))
+            else:
+                weighted_preds.append(np.nan)
+
+        ensemble_predictions["weighted_ensemble_pred"] = weighted_preds
 
     history_export = (
         eligible_panel[["series_id", "region", "commodity_name", "month", "price", TARGET_COL]]
@@ -543,6 +953,13 @@ def main():
         .reset_index(drop=True)
     )
     history_export["month"] = pd.to_datetime(history_export["month"]).dt.strftime("%Y-%m-%d")
+
+    holdout_base = ensemble_predictions.merge(
+        eligible_panel[["series_id", "month", "price", "price_lag_12"]],
+        on=["series_id", "month"],
+        how="left",
+    )
+    holdout_base["month"] = pd.to_datetime(holdout_base["month"], errors="coerce")
 
     holdout_model_columns = {
         "SARIMA": "sarima_pred",
@@ -573,13 +990,36 @@ def main():
         part["phase"] = "holdout"
         holdout_parts.append(part)
 
-    holdout_export = pd.concat(holdout_parts, ignore_index=True)
-    holdout_export["month"] = pd.to_datetime(holdout_export["month"]).dt.strftime("%Y-%m-%d")
-    holdout_export = holdout_export.sort_values(["region", "commodity_name", "model", "month"]).reset_index(drop=True)
+    holdout_export = pd.concat(holdout_parts, ignore_index=True) if holdout_parts else pd.DataFrame(
+        columns=[
+            "series_id", "region", "commodity_name", "month", "actual_yoy", "predicted_yoy",
+            "actual_price", "predicted_price", "abs_error_yoy", "abs_error_price", "pct_error_price", "phase", "model"
+        ]
+    )
+    if not holdout_export.empty:
+        holdout_export["month"] = pd.to_datetime(holdout_export["month"]).dt.strftime("%Y-%m-%d")
+        holdout_export = holdout_export.sort_values(["region", "commodity_name", "model", "month"]).reset_index(drop=True)
 
-    sarima_settings_lookup = {row["series_id"]: row.to_dict() for _, row in sarima_model_settings.iterrows()}
-    svr_settings_lookup = {row["series_id"]: row.to_dict() for _, row in svr_model_settings.iterrows()}
-    lightgbm_settings_lookup = {row["series_id"]: row.to_dict() for _, row in lightgbm_model_settings.iterrows()}
+    prediction_pairs = [
+        ("Naive", "naive_pred"),
+        ("Seasonal Naive", "seasonal_naive_pred"),
+        ("SARIMA", "sarima_pred"),
+        ("SVR", "svr_pred"),
+        ("LightGBM", "lightgbm_pred"),
+        ("Weighted Ensemble", "weighted_ensemble_pred"),
+    ]
+    series_metrics_export = hf.compute_series_metrics(ensemble_predictions, prediction_pairs)
+    global_metrics_export = hf.compute_metrics_table(ensemble_predictions, prediction_pairs)
+    if series_metrics_export.empty:
+        series_metrics_export = pd.DataFrame(
+            columns=["series_id", "region", "commodity_name", "model", "rmse", "mae", "r2", "rows_evaluated"]
+        )
+    else:
+        series_metrics_export = series_metrics_export.loc[series_metrics_export["model"].isin(APP_MODELS)].copy()
+    if global_metrics_export.empty:
+        global_metrics_export = pd.DataFrame(columns=["model", "rmse", "mae", "r2", "rows_evaluated"])
+    else:
+        global_metrics_export = global_metrics_export.loc[global_metrics_export["model"].isin(APP_MODELS)].copy()
 
     lightgbm_exog_candidates = [feature for feature in regional_exogenous_feature_columns if feature in eligible_panel.columns]
     if lightgbm_exog_candidates:
@@ -611,21 +1051,27 @@ def main():
                 model_future_frames.append(sarima_future)
 
         if series_id in svr_settings_lookup:
+            svr_feature_columns = svr_settings_lookup[series_id].get("feature_columns", svr_features)
             svr_future = forecast_svr_future(
                 series_frame[["series_id", "region", "commodity_name", "month", "price"]],
                 svr_settings_lookup[series_id],
-                svr_features,
+                svr_feature_columns,
                 FORECAST_MONTHS,
             )
             if not svr_future.empty:
                 model_future_frames.append(svr_future)
 
         if series_id in lightgbm_settings_lookup:
+            lightgbm_feature_columns = lightgbm_settings_lookup[series_id].get("feature_columns", lightgbm_features)
+            lightgbm_exog_columns = lightgbm_settings_lookup[series_id].get(
+                "exogenous_feature_columns",
+                lightgbm_exog_features,
+            )
             lightgbm_future = forecast_lightgbm_future(
                 series_frame,
                 lightgbm_settings_lookup[series_id],
-                lightgbm_features,
-                lightgbm_exog_features,
+                lightgbm_feature_columns,
+                lightgbm_exog_columns,
                 FORECAST_MONTHS,
             )
             if not lightgbm_future.empty:
@@ -637,10 +1083,11 @@ def main():
         series_future = pd.concat(model_future_frames, ignore_index=True)
         future_parts.append(series_future)
 
+        weight_row = ensemble_weight_lookup.get(series_id, {})
         weight_map = {
-            "SARIMA": inverse_rmse_weight(sarima_settings_lookup.get(series_id, {}).get("sarima_inner_rmse")),
-            "SVR": inverse_rmse_weight(svr_settings_lookup.get(series_id, {}).get("svr_inner_rmse")),
-            "LightGBM": inverse_rmse_weight(lightgbm_settings_lookup.get(series_id, {}).get("lightgbm_inner_rmse")),
+            "SARIMA": inverse_rmse_weight(weight_row.get("sarima_inner_rmse")),
+            "SVR": inverse_rmse_weight(weight_row.get("svr_inner_rmse")),
+            "LightGBM": inverse_rmse_weight(weight_row.get("lightgbm_inner_rmse")),
         }
         ensemble_rows = []
         for forecast_month, month_part in series_future.groupby("month"):
@@ -691,8 +1138,6 @@ def main():
         future_export["month"] = pd.to_datetime(future_export["month"]).dt.strftime("%Y-%m-%d")
         future_export = future_export.sort_values(["region", "commodity_name", "model", "month"]).reset_index(drop=True)
 
-    series_metrics_export = ensemble_series_metrics.loc[ensemble_series_metrics["model"].isin(APP_MODELS)].copy()
-    global_metrics_export = ensemble_global_metrics.loc[ensemble_global_metrics["model"].isin(APP_MODELS)].copy()
     normalized_series_metrics = compute_series_normalized_metrics(holdout_export)
     model_consistency_summary = compute_model_consistency_summary(normalized_series_metrics)
     if not normalized_series_metrics.empty:
@@ -717,6 +1162,7 @@ def main():
         .sort_values(["commodity_name", "region"])
         .reset_index(drop=True)
     )
+    series_profiles = build_series_profiles(series_options, series_metrics_export, ensemble_weight_lookup)
 
     payload = {
         "generated_at": pd.Timestamp.now().isoformat(),
@@ -725,17 +1171,38 @@ def main():
         "target_label": TARGET_LABEL,
         "models": APP_MODELS,
         "series_options": series_options.where(pd.notna(series_options), None).to_dict(orient="records"),
+        "series_profiles": series_profiles.where(pd.notna(series_profiles), None).to_dict(orient="records"),
         "history": history_export.where(pd.notna(history_export), None).to_dict(orient="records"),
         "holdout": holdout_export.where(pd.notna(holdout_export), None).to_dict(orient="records"),
         "future": future_export.where(pd.notna(future_export), None).to_dict(orient="records"),
         "series_metrics": series_metrics_export.where(pd.notna(series_metrics_export), None).to_dict(orient="records"),
-        "global_metrics": global_metrics_export.where(pd.notna(global_metrics_export), None).to_dict(orient="records"),
-        "model_consistency_summary": model_consistency_summary.where(pd.notna(model_consistency_summary), None).to_dict(orient="records"),
     }
 
-    with (WEBAPP_DATA_DIR / "dashboard.json").open("w", encoding="utf-8") as file_obj:
+    export_frame = pd.concat(
+        [
+            holdout_export.copy(),
+            future_export.copy(),
+        ],
+        ignore_index=True,
+    )
+
+    return payload, export_frame
+
+
+def write_dashboard_payload(payload, output_path):
+    with Path(output_path).open("w", encoding="utf-8") as file_obj:
         json.dump(payload, file_obj, indent=2)
 
+
+def export_results_csv(frame, output_path):
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(output_path, index=False)
+
+
+def main():
+    payload, export_frame = build_dashboard_payload()
+    write_dashboard_payload(payload, WEBAPP_DATA_DIR / "dashboard.json")
+    export_results_csv(export_frame, WEBAPP_DATA_DIR / "dashboard_results.csv")
     print(f"Exported webapp payload to {WEBAPP_DATA_DIR / 'dashboard.json'}")
 
 

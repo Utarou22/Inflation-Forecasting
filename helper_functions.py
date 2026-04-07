@@ -1,10 +1,10 @@
 import ast
 from contextlib import contextmanager
 from datetime import datetime
-import os
 from pathlib import Path
 import platform
-import sys
+import os
+import multiprocessing
 
 import constants as const
 
@@ -45,7 +45,6 @@ SARIMA_Q_VALUES = const.SARIMA_Q_VALUES
 SARIMA_P_SEASONAL_VALUES = const.SARIMA_P_SEASONAL_VALUES
 SARIMA_Q_SEASONAL_VALUES = const.SARIMA_Q_SEASONAL_VALUES
 SARIMA_TREND_VALUES = const.SARIMA_TREND_VALUES
-SARIMA_N_JOBS = const.SARIMA_N_JOBS
 SARIMA_MAXITER = const.SARIMA_MAXITER
 
 SVR_PARAM_GRID = const.SVR_PARAM_GRID
@@ -56,44 +55,22 @@ LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 
-def get_runtime_config(default_sarima_jobs=4):
-    cpu_total = os.cpu_count() or 1
-    system = platform.system()
-    machine = platform.machine().lower()
-    is_apple_silicon = system == "Darwin" and machine in {"arm64", "aarch64"}
-    in_notebook = "ipykernel" in sys.modules
+def get_environment_config():
+    sys_name = platform.system().lower()
+    backend = "loky"
+    n_jobs = multiprocessing.cpu_count()
+    if sys_name == "darwin":
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
-    reserve_cores = 2 if cpu_total >= 8 else 1
-    available_parallel_jobs = max(1, cpu_total - reserve_cores)
-
-    if is_apple_silicon:
-        sarima_n_jobs = max(int(default_sarima_jobs), available_parallel_jobs)
-        sklearn_n_jobs = max(1, min(6, available_parallel_jobs))
-        lightgbm_n_jobs = max(1, min(6, available_parallel_jobs))
-        use_parallel_sarima = True
-    else:
-        sarima_n_jobs = max(1, min(int(default_sarima_jobs), available_parallel_jobs))
-        sklearn_n_jobs = 1
-        lightgbm_n_jobs = 1
-        use_parallel_sarima = not (system == "Windows" and in_notebook)
-
-    return {
-        "system": system,
-        "machine": machine,
-        "cpu_total": cpu_total,
-        "is_apple_silicon": is_apple_silicon,
-        "in_notebook": in_notebook,
-        "sarima_n_jobs": sarima_n_jobs,
-        "sklearn_n_jobs": sklearn_n_jobs,
-        "lightgbm_n_jobs": lightgbm_n_jobs,
-        "use_parallel_sarima": use_parallel_sarima,
-    }
-
-
-def log_progress(message):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}", flush=True)
-
+        try:
+            p_cores = int(os.popen("sysctl -n hw.perflevel0.physicalcpu").read().strip())
+            return p_cores
+        except:
+            return 4
+    return n_jobs, backend
 
 def series_label(meta):
     series_id = str(meta.get("series_id", "unknown"))
@@ -105,39 +82,6 @@ def series_label(meta):
         return series_id
 
     return f"{' | '.join(name_parts)} [{series_id}]"
-
-
-def log_completed_task(task_name, completed, total, item_label=None, status="completed"):
-    suffix = f" - {item_label}" if item_label else ""
-    log_progress(f"{task_name}: {status} {completed}/{total}{suffix}")
-
-
-@contextmanager
-def joblib_progress(task_name, total):
-    if total <= 0:
-        log_progress(f"{task_name}: no tasks queued")
-        yield
-        return
-
-    completed = {"count": 0}
-    original_callback = joblib.parallel.BatchCompletionCallBack
-
-    class ProgressBatchCompletionCallback(original_callback):
-        def __call__(self, *args, **kwargs):
-            completed["count"] += self.batch_size
-            finished = min(completed["count"], total)
-            log_progress(f"{task_name}: completed {finished}/{total}")
-            return super().__call__(*args, **kwargs)
-
-    joblib.parallel.BatchCompletionCallBack = ProgressBatchCompletionCallback
-    log_progress(f"{task_name}: started 0/{total}")
-
-    try:
-        yield
-    finally:
-        joblib.parallel.BatchCompletionCallBack = original_callback
-        log_progress(f"{task_name}: finished {min(completed['count'], total)}/{total}")
-
 
 def transform_series(series, mode):
     series = pd.to_numeric(series, errors="coerce").astype(float)
@@ -461,6 +405,10 @@ def rmse(y_true, y_pred):
     y_pred = np.asarray(y_pred, dtype=float)
     return float(np.sqrt(np.mean(np.square(y_true - y_pred))))
 
+def inverse_rmse_weight(value):
+    if pd.isna(value) or not np.isfinite(value) or value <= 0:
+        return 0.0
+    return 1.0 / float(value)
 
 def mae(y_true, y_pred):
     y_true = np.asarray(y_true, dtype=float)
@@ -843,13 +791,10 @@ def build_ml_tuning_frame(df, feature_cols, exog_cols=None):
     }
 
 
-def run_svr_models(manifest, panel, feature_cols, cv_n_jobs=1):
+def run_svr_models(manifest, panel, feature_cols):
     prediction_rows = []
     svr_settings_rows = []
     total_series = int(len(manifest))
-
-    if total_series > 0:
-        log_progress(f"SVR series: started 0/{total_series}")
 
     for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
         label = series_label(meta)
@@ -884,7 +829,7 @@ def run_svr_models(manifest, panel, feature_cols, cv_n_jobs=1):
             param_grid=SVR_PARAM_GRID,
             scoring="neg_root_mean_squared_error",
             cv=time_cv,
-            n_jobs=cv_n_jobs,
+            n_jobs=1,
             refit=True,
         )
 
@@ -969,8 +914,6 @@ def run_svr_models(manifest, panel, feature_cols, cv_n_jobs=1):
 
         log_completed_task("SVR series", completed, total_series, label)
 
-    if total_series > 0:
-        log_progress(f"SVR series: finished {total_series}/{total_series}")
 
     return pd.DataFrame(prediction_rows), pd.DataFrame(svr_settings_rows)
 
@@ -983,7 +926,7 @@ def fill_lightgbm_exog_from_history(train_block, row, exog_cols):
                 row[col] = float(last_known.iloc[-1])
     return row
 
-def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols, lightgbm_n_jobs=1):
+def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols):
     if not feature_cols:
         return None, float("inf")
 
@@ -1014,7 +957,7 @@ def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols, lightgbm_n_job
                 objective="regression",
                 random_state=LIGHTGBM_RANDOM_STATE,
                 verbosity=-1,
-                n_jobs=lightgbm_n_jobs,
+                n_jobs=1,
                 force_col_wise=True,
                 max_bin=127,
                 **params,
@@ -1037,13 +980,11 @@ def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols, lightgbm_n_job
     return study.best_params, float(study.best_value)
 
 
-def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_jobs=1):
+def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
     prediction_rows = []
     settings_rows = []
     total_series = int(len(manifest))
 
-    if total_series > 0:
-        log_progress(f"LightGBM series: started 0/{total_series}")
 
     for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
         label = series_label(meta)
@@ -1058,12 +999,7 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_job
         tuning = prepared["tuning"]
         inner_splits = prepared["inner_splits"]
 
-        best_params, best_rmse = tune_lightgbm_feature_set(
-            tuning,
-            inner_splits,
-            feature_cols,
-            lightgbm_n_jobs=lightgbm_n_jobs,
-        )
+        best_params, best_rmse = tune_lightgbm_feature_set(tuning, inner_splits, feature_cols)
         if best_params is None:
             log_completed_task("LightGBM series", completed, total_series, label, status="skipped")
             continue
@@ -1072,7 +1008,7 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_job
             objective="regression",
             random_state=LIGHTGBM_RANDOM_STATE,
             verbosity=-1,
-            n_jobs=lightgbm_n_jobs,
+            n_jobs=1,
             force_col_wise=True,
             max_bin=127,
             **best_params,
@@ -1138,7 +1074,7 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_job
                         objective="regression",
                         random_state=LIGHTGBM_RANDOM_STATE,
                         verbosity=-1,
-                        n_jobs=lightgbm_n_jobs,
+                        n_jobs=1,
                         force_col_wise=True,
                         max_bin=127,
                         **best_params,
@@ -1162,9 +1098,6 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols, lightgbm_n_job
             })
 
         log_completed_task("LightGBM series", completed, total_series, label)
-
-    if total_series > 0:
-        log_progress(f"LightGBM series: finished {total_series}/{total_series}")
 
     return pd.DataFrame(prediction_rows), pd.DataFrame(settings_rows)
 

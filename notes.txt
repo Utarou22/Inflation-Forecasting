@@ -1,0 +1,2 @@
+get_environment_config() - checking if main.py runs on Windows or Mac
+series_label(meta) - generate id for the merged dataset for series

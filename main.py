@@ -1,14 +1,3 @@
-import os
-import platform
-
-IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}
-if IS_APPLE_SILICON:
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-    os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
-
 import helper_functions as hf
 import constants as const
 
@@ -34,6 +23,8 @@ from sklearn.svm import SVR
 
 from constants import SVR_BASE_FEATURES, MODEL_SERIES_CAP_FALLBACK
 
+DRIVER_COLUMNS = const.DRIVER_COLUMNS
+
 MAX_LAG = const.MAX_LAG
 MIN_OBS = const.MIN_OBS
 ALPHA = const.ALPHA
@@ -41,8 +32,11 @@ SHORTLIST_MIN_OVERLAP = const.SHORTLIST_MIN_OVERLAP
 TRANSFORM_MODES = const.TRANSFORM_MODES
 GLOBAL_DRIVER_MIN_SHORTLISTED_SERIES = const.GLOBAL_DRIVER_MIN_SHORTLISTED_SERIES
 
+WINDOW_MIN_MONTHS = const.WINDOW_MIN_MONTHS
+WINDOW_MAX_MONTHS = const.WINDOW_MAX_MONTHS
 MODEL_SERIES_CAP = const.MODEL_SERIES_CAP
 MDOEL_SERIES_CAP_FALLBACK = const.MODEL_SERIES_CAP_FALLBACK
+
 TARGET_COL = const.TARGET_COL
 TARGET_LABEL = const.TARGET_LABEL
 MIN_TRAIN_TARGET_ROWS = const.MIN_TRAIN_TARGET_ROWS
@@ -59,7 +53,6 @@ SARIMA_P_SEASONAL_VALUES = const.SARIMA_P_SEASONAL_VALUES
 SARIMA_Q_SEASONAL_VALUES = const.SARIMA_Q_SEASONAL_VALUES
 SARIMA_TREND_VALUES = const.SARIMA_TREND_VALUES
 SARIMA_MAXITER = const.SARIMA_MAXITER
-SARIMA_N_JOBS = const.SARIMA_N_JOBS
 
 SVR_BASE_FEATURES = const.SVR_BASE_FEATURES
 SVR_PARAM_GRID = const.SVR_PARAM_GRID
@@ -68,25 +61,7 @@ LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 
-RUNTIME_CONFIG = hf.get_runtime_config(SARIMA_N_JOBS)
-SARIMA_N_JOBS = RUNTIME_CONFIG["sarima_n_jobs"]
-SKLEARN_N_JOBS = RUNTIME_CONFIG["sklearn_n_jobs"]
-LIGHTGBM_N_JOBS = RUNTIME_CONFIG["lightgbm_n_jobs"]
-
-
-def print_table(title, df):
-    print(f"\n=== {title} ===")
-    if df is None or df.empty:
-        print("(empty)")
-        return
-    print(df.to_string(index=False))
-
-hf.log_progress("Pipeline started")
-hf.log_progress(
-    f"Runtime config: system={RUNTIME_CONFIG['system']}, machine={RUNTIME_CONFIG['machine']}, "
-    f"cpu_total={RUNTIME_CONFIG['cpu_total']}, sarima_jobs={SARIMA_N_JOBS}, "
-    f"sklearn_jobs={SKLEARN_N_JOBS}, lightgbm_jobs={LIGHTGBM_N_JOBS}"
-)
+N_JOBS, BACKEND = hf.get_environment_config()
 
 # 1. DATA PREPARATION AND PREPROCESS
 df_main = pd.read_csv("data/main/Combined Main Dataset.csv", low_memory=False)
@@ -139,9 +114,7 @@ macro_external_monthly = (
 macro_external_monthly = macro_external_monthly.dropna(subset=macro_external_monthly.columns.difference(["month"]))
 macro_external_monthly.to_html("tables/1.0.a Macro External Monthly.html")
 print("\n===DATASETS SUCCESSFULLY LOADED===\n")
-hf.log_progress(
-    f"1.0 Data preparation complete: {len(df_main):,} main rows, {len(macro_external_monthly):,} macro rows"
-)
+print(f"1.0 Data preparation complete: {len(df_main):,} main rows, {len(macro_external_monthly):,} macro rows")
 
 df_main.info()
 print()
@@ -150,30 +123,21 @@ macro_external_monthly.info()
 df_main["month"] = pd.to_datetime(df_main["month"], errors="coerce")
 df_main["price"] = pd.to_numeric(df_main["price"], errors="coerce")
 
-# 1.1. Granger Causality Test
+#======= 1.1. Granger Causality Test =======
 commodity_granger_monthly = (
     df_main.groupby(["commodity_name", "month"], as_index=False)
     .agg(price=("price", "median"))
     .sort_values(["commodity_name", "month"])
     .reset_index(drop=True)
 )
-commodity_granger_monthly["source"] = "combined_main"
 
-driver_columns = [
-    "diesel_price",
-    "food_price_index",
-    "max_consecutive_dry_days",
-    "days_above_35c",
-    "precipitation_mm",
-    "days_rain_above_50mm_extreme",
-    "avg_mean_temp_c",
-]
+print(commodity_granger_monthly.head())
 
 granger_result_frames = []
 for transform_mode in TRANSFORM_MODES:
     transform_rows = []
 
-    for driver_name in driver_columns:
+    for driver_name in DRIVER_COLUMNS:
         external_series = hf.transform_series(
             macro_external_monthly.set_index("month")[driver_name].sort_index(),
             transform_mode
@@ -202,7 +166,6 @@ for transform_mode in TRANSFORM_MODES:
             )
 
             transform_rows.append({
-                "source": "combined_main",
                 "commodity_name": commodity_name,
                 "transform_mode": transform_mode,
                 "driver_name": driver_name,
@@ -223,7 +186,7 @@ for transform_mode in TRANSFORM_MODES:
     transform_df["forward_bh_p_value"] = np.nan
     transform_df["reverse_bh_p_value"] = np.nan
 
-    for driver_name in driver_columns:
+    for driver_name in DRIVER_COLUMNS:
         mask = transform_df["driver_name"] == driver_name
         transform_df.loc[mask, "forward_bh_p_value"] = hf.benjamini_hochberg(transform_df.loc[mask, "forward_min_p_value"])
         transform_df.loc[mask, "reverse_bh_p_value"] = hf.benjamini_hochberg(transform_df.loc[mask, "reverse_min_p_value"])
@@ -252,6 +215,7 @@ granger_overview = (
     .sort_values(["transform_mode", "driver_name"])
     .reset_index(drop=True)
 )
+granger_overview.to_html("tables/1.1.a Granger Causality Test Overview.html")
 
 global_driver_shortlist = (
     granger_results_all.loc[granger_results_all["shortlist_candidate"].fillna(False)]
@@ -268,7 +232,6 @@ global_driver_shortlist = (
     .sort_values(["shortlisted_series", "median_bh_p_value"], ascending=[False, True])
     .reset_index(drop=True)
 )
-
 if global_driver_shortlist.empty:
     global_shortlisted_driver_lags = {}
 else:
@@ -281,6 +244,7 @@ else:
         row["driver_name"]: int(max(1, min(MAX_LAG, row["modal_best_lag"])))
         for _, row in selected_driver_rows.iterrows()
     }
+global_driver_shortlist.to_html("tables/1.1.b Global Driver Shortlist.html")
 
 global_shortlisted_driver_table = pd.DataFrame(
     [
@@ -291,16 +255,10 @@ global_shortlisted_driver_table = pd.DataFrame(
         for driver_name, lag_value in global_shortlisted_driver_lags.items()
     ]
 )
-
-granger_overview.to_html("tables/1.1.a Granger Causality Test Overview.html")
-global_driver_shortlist.to_html("tables/1.1.b Global Driver Shortlist.html")
 global_shortlisted_driver_table.to_html("tables/1.1.c Global Shortlisted Driver.html")
-hf.log_progress(
-    f"1.1 Granger causality complete: {len(granger_results_all):,} tests, "
-    f"{len(global_shortlisted_driver_lags):,} shortlisted drivers"
-)
 
-# 1.2. Filter Valid Entries
+
+#======= 1.2. Filter Valid Entries =======
 valid_series = []
 for (region, commodity_name), group in df_main.groupby(["region", "commodity_name"]):
     interpolated = hf.apply_linear_interpolation(group, max_gap=2)
@@ -308,7 +266,7 @@ for (region, commodity_name), group in df_main.groupby(["region", "commodity_nam
     if interpolated is None:
         continue
 
-    if len(interpolated) >= 36:
+    if len(interpolated) >= WINDOW_MIN_MONTHS:
         interpolated["region"] = region
         interpolated["commodity_name"] = commodity_name
         valid_series.append(interpolated)
@@ -317,12 +275,8 @@ df_main_filtered = pd.concat(valid_series, ignore_index=True)
 df_main_filtered = df_main_filtered.sort_values(
     ["region", "commodity_name", "month"]
 ).reset_index(drop=True)
-hf.log_progress(
-    f"1.2 Valid series filtering complete: {df_main_filtered['region'].nunique():,} regions, "
-    f"{df_main_filtered['commodity_name'].nunique():,} commodities, {len(df_main_filtered):,} rows"
-)
 
-# 1.3. Feature Engineering
+#======= 1.3. Feature Engineering =======
 df_main_filtered = df_main_filtered.merge(
     macro_external_monthly,
     on="month",
@@ -426,11 +380,6 @@ evaluation_setup = pd.DataFrame(
 
 evaluation_setup.to_html("tables/1.3.c Evaluation Setup.html", index=False)
 split_readiness.to_html("tables/1.3.d Split Readiness.html", index=False)
-hf.log_progress(
-    f"1.3 Feature engineering complete: {eligible_panel['series_id'].nunique():,} eligible series, "
-    f"{len(eligible_panel):,} panel rows"
-)
-
 # SARIMA Benchmarking and Evaluation
 # Stationarity diagnostics
 stationarity_rows = []
@@ -557,10 +506,6 @@ sarima_readiness_overview = pd.DataFrame([
 
 sarima_readiness_overview.to_html("tables/1.4.f SARIMA Readiness Overview.html", index=False)
 sarima_readiness.to_html("tables/1.4.g SARIMA Readiness.html", index=False)
-hf.log_progress(
-    f"1.4 Diagnostics complete: {len(stationarity_results):,} stationarity checks, "
-    f"{len(seasonality_results):,} seasonality checks, {len(sarima_readiness):,} SARIMA-ready rows"
-)
 
 # Visual 1: Series-length distribution
 fig, ax = plt.subplots(figsize=(8, 4.5))
@@ -747,9 +692,6 @@ sarima_search_space = pd.DataFrame([
     }
 ])
 sarima_search_space.to_html("tables/2.1.a SARIMA Search Space.html", index=False)
-hf.log_progress(
-    f"2.1 SARIMA search space ready: {len(sarima_ready_manifest):,} series, {SARIMA_N_JOBS} workers"
-)
 
 series_lookup = {
     series_id: part.copy()
@@ -766,8 +708,8 @@ if sarima_ready_manifest.empty:
 else:
     with hf.joblib_progress("SARIMA series", total=len(sarima_ready_manifest)):
         sarima_outputs = Parallel(
-            n_jobs=SARIMA_N_JOBS,
-            backend="loky",
+            n_jobs=N_JOBS,
+            backend=BACKEND,
             batch_size=1,
             verbose=0
         )(
@@ -797,12 +739,6 @@ sarima_run_overview = pd.DataFrame([
 sarima_run_overview.to_html("tables/2.1.b SARIMA Run Overview.html", index=False)
 sarima_model_settings.to_html("tables/2.1.c SARIMA Model Settings.html", index=False)
 sarima_predictions.to_html("tables/2.1.d SARIMA Predictions.html", index=False)
-print_table("SARIMA Run Overview", sarima_run_overview)
-hf.log_progress(
-    f"2.1 SARIMA forecasting complete: "
-    f"{sarima_run_overview['series_modeled'].iloc[0] if not sarima_run_overview.empty else 0:,} series modeled, "
-    f"{sarima_run_overview['holdout_predictions'].iloc[0] if not sarima_run_overview.empty else 0:,} holdout predictions"
-)
 
 prediction_pairs = [
     ("Naive", "naive_pred"),
@@ -812,7 +748,6 @@ prediction_pairs = [
 
 sarima_global_metrics = hf.compute_metrics_table(sarima_predictions, prediction_pairs)
 sarima_global_metrics.to_html("tables/2.1.e Global Forecast Metrics.html", index=False)
-print_table("SARIMA Global Metrics", sarima_global_metrics)
 
 sarima_series_metrics = hf.compute_series_metrics(sarima_predictions, prediction_pairs)
 sarima_series_metrics.to_html("tables/2.1.f Series Forecast Metrics.html", index=False)
@@ -826,7 +761,6 @@ hf.save_residual_distribution_plots(
     "visuals/2.2.e Residual QQ Plots.png",
     "SARIMA Evaluation",
 )
-hf.log_progress("2.2 SARIMA evaluation outputs saved")
 
 # Visual 1: Benchmark comparison
 if not sarima_global_metrics.empty:
@@ -919,16 +853,11 @@ svr_feature_manifest = pd.DataFrame([
     }
 ])
 svr_feature_manifest.to_html("tables/3.1.a SVR Feature Manifest.html", index=False)
-hf.log_progress(
-    f"3.1 SVR setup ready: {len(non_linear_ready_manifest):,} candidate series, "
-    f"{len(SVR_BASE_FEATURES):,} features"
-)
 
 svr_predictions, svr_model_settings = hf.run_svr_models(
     non_linear_ready_manifest,
     eligible_panel,
     SVR_BASE_FEATURES,
-    cv_n_jobs=SKLEARN_N_JOBS,
 )
 
 non_linear_predictions = sarima_predictions.merge(
@@ -963,7 +892,6 @@ svr_run_overview = pd.DataFrame([
 svr_global_metrics = hf.compute_metrics_table(non_linear_predictions, svr_prediction_pairs)
 svr_series_metrics = hf.compute_series_metrics(non_linear_predictions, svr_prediction_pairs)
 svr_residual_diagnostics = hf.compute_diagnostics(non_linear_predictions, svr_prediction_pairs)
-print_table("SVR Global Metrics", svr_global_metrics)
 
 svr_run_overview.to_html("tables/3.1.b SVR Run Overview.html", index=False)
 svr_model_settings.to_html("tables/3.1.c SVR Model Settings.html", index=False)
@@ -977,10 +905,6 @@ hf.save_residual_distribution_plots(
     "visuals/3.2.c Residual Histograms.png",
     "visuals/3.2.d Residual QQ Plots.png",
     "SVR Evaluation",
-)
-print_table("SVR Run Overview", svr_run_overview)
-hf.log_progress(
-    f"3.2 SVR complete: {len(svr_model_settings):,} models, {len(svr_predictions):,} prediction rows"
 )
 
 # Visual 1: Benchmark comparison
@@ -1066,7 +990,6 @@ lightgbm_predictions, lightgbm_model_settings = hf.run_lightgbm_models(
     eligible_panel,
     LIGHTGBM_FEATURES,
     LIGHTGBM_EXOG_FEATURES,
-    lightgbm_n_jobs=LIGHTGBM_N_JOBS,
 )
 
 if lightgbm_predictions.empty:
@@ -1100,7 +1023,6 @@ lightgbm_prediction_pairs = [
 lightgbm_global_metrics = hf.compute_metrics_table(non_linear_predictions, lightgbm_prediction_pairs)
 lightgbm_series_metrics = hf.compute_series_metrics(non_linear_predictions, lightgbm_prediction_pairs)
 lightgbm_diagnostics = hf.compute_diagnostics(non_linear_predictions, lightgbm_prediction_pairs)
-print_table("LightGBM Global Metrics", lightgbm_global_metrics)
 
 lightgbm_run_overview.to_html("tables/4.1.b LightGBM Run Overview.html", index=False)
 lightgbm_model_settings.to_html("tables/4.1.c LightGBM Model Settings.html", index=False)
@@ -1114,10 +1036,6 @@ hf.save_residual_distribution_plots(
     "visuals/4.2.b Residual Histograms.png",
     "visuals/4.2.c Residual QQ Plots.png",
     "LightGBM Evaluation",
-)
-print_table("LightGBM Run Overview", lightgbm_run_overview)
-hf.log_progress(
-    f"4.2 LightGBM complete: {len(lightgbm_model_settings):,} models, {len(lightgbm_predictions):,} prediction rows"
 )
 
 # Visual 1: LightGBM benchmark comparison
@@ -1146,11 +1064,6 @@ ensemble_weights = (
 
 ensemble_predictions = non_linear_predictions.merge(ensemble_weights, on="series_id", how="left").copy()
 
-def inverse_rmse_weight(value):
-    if pd.isna(value) or not np.isfinite(value) or value <= 0:
-        return 0.0
-    return 1.0 / float(value)
-
 weighted_preds = []
 sarima_weights = []
 svr_weights = []
@@ -1163,9 +1076,9 @@ for _, row in ensemble_predictions.iterrows():
     )
     weights = np.asarray(
         [
-            inverse_rmse_weight(row.get("sarima_inner_rmse")),
-            inverse_rmse_weight(row.get("svr_inner_rmse")),
-            inverse_rmse_weight(row.get("lightgbm_inner_rmse")),
+            hf.inverse_rmse_weight(row.get("sarima_inner_rmse")),
+            hf.inverse_rmse_weight(row.get("svr_inner_rmse")),
+            hf.inverse_rmse_weight(row.get("lightgbm_inner_rmse")),
         ],
         dtype=float,
     )
@@ -1221,7 +1134,6 @@ ensemble_prediction_pairs = [
 ensemble_global_metrics = hf.compute_metrics_table(ensemble_predictions, ensemble_prediction_pairs)
 ensemble_series_metrics = hf.compute_series_metrics(ensemble_predictions, ensemble_prediction_pairs)
 ensemble_diagnostics = hf.compute_diagnostics(ensemble_predictions, ensemble_prediction_pairs)
-print_table("Ensemble Global Metrics", ensemble_global_metrics)
 ensemble_series_diagnostics = hf.compute_series_diagnostics(ensemble_predictions,ensemble_prediction_pairs)
 
 diagnostic_summary = (
@@ -1276,10 +1188,6 @@ artifact_export_overview = (
 )
 artifact_manifest.to_html("tables/5.1.i Artifact Manifest.html", index=False)
 artifact_export_overview.to_html("tables/5.1.j Artifact Export Overview.html", index=False)
-hf.log_progress(
-    f"5.1 Ensemble and artifacts complete: {len(artifact_manifest):,} artifact records, "
-    f"{len(ensemble_predictions):,} ensemble prediction rows"
-)
 
 # Visual 1: Ensemble benchmark comparison
 if not ensemble_global_metrics.empty:
@@ -1344,5 +1252,3 @@ if not ensemble_series_metrics.empty:
         fig.tight_layout()
         plt.savefig("visuals/5.2.b Best Ensemble Forecasts.png", dpi=200, bbox_inches="tight")
         plt.close()
-
-hf.log_progress("Pipeline finished")

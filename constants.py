@@ -6,6 +6,16 @@ SHORTLIST_MIN_OVERLAP = 60
 TRANSFORM_MODES = ["diff", "mom_pct"]
 GLOBAL_DRIVER_MIN_SHORTLISTED_SERIES = 8
 
+DRIVER_COLUMNS = [
+    "diesel_price",
+    "food_price_index",
+    "max_consecutive_dry_days",
+    "days_above_35c",
+    "precipitation_mm",
+    "days_rain_above_50mm_extreme",
+    "avg_mean_temp_c",
+]
+
 # Panel filtering
 WINDOW_MIN_MONTHS = 36
 WINDOW_MAX_MONTHS = 60
@@ -30,7 +40,6 @@ SARIMA_P_SEASONAL_VALUES = [0, 1]
 SARIMA_Q_SEASONAL_VALUES = [0, 1]
 SARIMA_TREND_VALUES = ["n", "c"]
 SARIMA_MAXITER = 300
-SARIMA_N_JOBS = 4
 
 # SVR
 SVR_BASE_FEATURES = [
