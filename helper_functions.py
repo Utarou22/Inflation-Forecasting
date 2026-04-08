@@ -56,26 +56,13 @@ LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 
 
-def _progress_message(task_name, completed, total, label=None, status="done"):
+def _joblib_progress_message(task_name, completed, total):
     total = max(int(total or 0), 0)
-    completed = min(max(int(completed or 0), 0), total) if total else int(completed or 0)
+    completed = max(int(completed or 0), 0)
     if total > 0:
-        message = f"[{task_name}] {completed}/{total}"
-    else:
-        message = f"[{task_name}] {completed}"
-    if status and status != "done":
-        message = f"{message} ({status})"
-    if label:
-        message = f"{message}: {label}"
-    return message
-
-
-def log_progress(task_name, completed, total, label=None, status="done"):
-    print(_progress_message(task_name, completed, total, label=label, status=status), flush=True)
-
-
-def log_completed_task(task_name, completed, total, label=None, status="done"):
-    log_progress(task_name, completed, total, label=label, status=status)
+        completed = min(completed, total)
+        return f"[{task_name}] {completed}/{total}"
+    return f"[{task_name}] {completed}"
 
 
 @contextmanager
@@ -85,9 +72,8 @@ def joblib_progress(task_name, total=None):
 
     class ProgressBatchCompletionCallBack(original_callback):
         def __call__(self, *args, **kwargs):
-            batch_size = self.batch_size or 1
-            state["completed"] += batch_size
-            log_progress(task_name, state["completed"], state["total"])
+            state["completed"] += self.batch_size or 1
+            print(_joblib_progress_message(task_name, state["completed"], state["total"]), flush=True)
             return super().__call__(*args, **kwargs)
 
     joblib.parallel.BatchCompletionCallBack = ProgressBatchCompletionCallBack
@@ -854,27 +840,22 @@ def build_ml_tuning_frame(df, feature_cols, exog_cols=None):
 def run_svr_models(manifest, panel, feature_cols):
     prediction_rows = []
     svr_settings_rows = []
-    total_series = int(len(manifest))
 
     for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
-        label = series_label(meta)
         df = panel.loc[panel["series_id"] == meta["series_id"]].sort_values("month").reset_index(drop=True)
         prepared = build_ml_tuning_frame(df, feature_cols)
 
         if prepared is None:
-            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         test_positions = prepared["test_positions"]
         tuning = prepared["tuning"]
 
         if len(tuning) < MIN_TRAIN_OBS_ML:
-            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         n_splits = min(INNER_FOLDS_ML, max(2, len(tuning) - MIN_TRAIN_OBS_ML))
         if n_splits < 2:
-            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         time_cv = TimeSeriesSplit(n_splits=n_splits)
@@ -902,7 +883,6 @@ def run_svr_models(manifest, panel, feature_cols):
             best_params = grid.best_params_
             best_rmse = -float(grid.best_score_)
         except Exception:
-            log_completed_task("SVR series", completed, total_series, label, status="skipped")
             continue
 
         svr_settings_rows.append({
@@ -971,10 +951,6 @@ def run_svr_models(manifest, panel, feature_cols):
                 "seasonal_naive_pred": float(seasonal_pred),
                 "svr_pred": float(svr_pred),
             })
-
-        log_completed_task("SVR series", completed, total_series, label)
-
-
     return pd.DataFrame(prediction_rows), pd.DataFrame(svr_settings_rows)
 
 def fill_lightgbm_exog_from_history(train_block, row, exog_cols):
@@ -1043,16 +1019,11 @@ def tune_lightgbm_feature_set(tuning, inner_splits, feature_cols):
 def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
     prediction_rows = []
     settings_rows = []
-    total_series = int(len(manifest))
-
-
     for completed, (_, meta) in enumerate(manifest.iterrows(), start=1):
-        label = series_label(meta)
         df = panel.loc[panel["series_id"] == meta["series_id"]].sort_values("month").reset_index(drop=True)
         prepared = build_ml_tuning_frame(df, feature_cols, exog_cols=exog_cols)
 
         if prepared is None:
-            log_completed_task("LightGBM series", completed, total_series, label, status="skipped")
             continue
 
         test_positions = prepared["test_positions"]
@@ -1061,7 +1032,6 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
 
         best_params, best_rmse = tune_lightgbm_feature_set(tuning, inner_splits, feature_cols)
         if best_params is None:
-            log_completed_task("LightGBM series", completed, total_series, label, status="skipped")
             continue
 
         feature_probe = lgb.LGBMRegressor(
@@ -1156,9 +1126,6 @@ def run_lightgbm_models(manifest, panel, feature_cols, exog_cols):
                 "seasonal_naive_pred": float(seasonal_pred),
                 "lightgbm_pred": float(lightgbm_pred),
             })
-
-        log_completed_task("LightGBM series", completed, total_series, label)
-
     return pd.DataFrame(prediction_rows), pd.DataFrame(settings_rows)
 
 

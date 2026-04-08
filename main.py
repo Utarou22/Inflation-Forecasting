@@ -254,7 +254,7 @@ global_shortlisted_driver_table = pd.DataFrame(
     ]
 )
 global_shortlisted_driver_table.to_html("tables/1.1.c Global Shortlisted Driver.html")
-
+print("\nGranger Causality Test Finished\n")
 
 #======= 1.2. Filter Valid Entries =======
 valid_series = []
@@ -977,11 +977,6 @@ lightgbm_feature_manifest = pd.DataFrame([
     }
 ])
 lightgbm_feature_manifest.to_html("tables/4.1.a LightGBM Feature Manifest.html", index=False)
-hf.log_progress(
-    f"4.1 LightGBM setup ready: {len(non_linear_ready_manifest):,} candidate series, "
-    f"{len(LIGHTGBM_FEATURES):,} features"
-)
-
 lightgbm_predictions, lightgbm_model_settings = hf.run_lightgbm_models(
     non_linear_ready_manifest,
     eligible_panel,
