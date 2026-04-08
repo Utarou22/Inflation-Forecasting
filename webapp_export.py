@@ -3,6 +3,7 @@ from io import StringIO
 import json
 from html.parser import HTMLParser
 from pathlib import Path
+import re
 import warnings
 
 import joblib
@@ -47,6 +48,53 @@ EXOG_DRIVER_COLUMNS = [
     "avg_mean_temp_c",
 ]
 
+REGION_NAME_MAP = {
+    "NATIONAL CAPITAL REGION": "NCR",
+    "NATIONAL CAPITAL REGION NCR": "NCR",
+    "NCR": "NCR",
+    "CORDILLERA ADMINISTRATIVE REGION": "CAR",
+    "CORDILLERA ADMINISTRATIVE REGION CAR": "CAR",
+    "CAR": "CAR",
+    "AUTONOMOUS REGION IN MUSLIM MINDANAO": "ARMM",
+    "AUTONOMOUS REGION IN MUSLIM MINDANAO ARMM": "ARMM",
+    "ARMM": "ARMM",
+    "MIMAROPA REGION": "REGION IV-B",
+    "REGION I ILOCOS REGION": "REGION I",
+    "REGION II CAGAYAN VALLEY": "REGION II",
+    "REGION III CENTRAL LUZON": "REGION III",
+    "REGION IV A CALABARZON": "REGION IV-A",
+    "REGION IV B MIMAROPA": "REGION IV-B",
+    "REGION V BICOL REGION": "REGION V",
+    "REGION VI WESTERN VISAYAS": "REGION VI",
+    "REGION VII CENTRAL VISAYAS": "REGION VII",
+    "REGION VIII EASTERN VISAYAS": "REGION VIII",
+    "REGION IX ZAMBOANGA PENINSULA": "REGION IX",
+    "REGION X NORTHERN MINDANAO": "REGION X",
+    "REGION XI DAVAO REGION": "REGION XI",
+    "REGION XII SOCCSKSARGEN": "REGION XII",
+    "REGION XIII CARAGA": "REGION XIII",
+}
+ROMAN_REGION_MAP = {
+    "1": "I",
+    "2": "II",
+    "3": "III",
+    "4": "IV",
+    "5": "V",
+    "6": "VI",
+    "7": "VII",
+    "8": "VIII",
+    "9": "IX",
+    "10": "X",
+    "11": "XI",
+    "12": "XII",
+    "13": "XIII",
+}
+MODEL_RMSE_KEYS = {
+    "SARIMA": "sarima_inner_rmse",
+    "SVR": "svr_inner_rmse",
+    "LightGBM": "lightgbm_inner_rmse",
+}
+
 
 def parse_literal(value, fallback=None):
     if isinstance(value, (list, tuple, dict)):
@@ -57,6 +105,60 @@ def parse_literal(value, fallback=None):
         return ast.literal_eval(str(value))
     except (SyntaxError, ValueError):
         return fallback
+
+
+def clean_text_value(value):
+    if pd.isna(value):
+        return np.nan
+    text = str(value).strip()
+    return text if text else np.nan
+
+
+def normalize_commodity_value(value):
+    text = clean_text_value(value)
+    if pd.isna(text):
+        return np.nan
+    normalized = re.sub(r"\s+", " ", str(text).replace('"', "").replace(",", " ")).strip()
+    return normalized.upper() if normalized else np.nan
+
+
+def normalize_region_value(value):
+    text = clean_text_value(value)
+    if pd.isna(text):
+        return np.nan
+
+    text = str(text).upper().strip()
+    text = re.sub(r"[()]", " ", text)
+    text = re.sub(r"[-_/]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if text in REGION_NAME_MAP:
+        return REGION_NAME_MAP[text]
+
+    numeric_match = re.match(r"^REGION\s+(\d{1,2})(?:\s*([AB]))?$", text)
+    if numeric_match:
+        region_number = numeric_match.group(1)
+        suffix = numeric_match.group(2)
+        roman_value = ROMAN_REGION_MAP.get(region_number)
+        if roman_value:
+            return f"REGION {roman_value}{('-' + suffix) if suffix else ''}"
+
+    roman_match = re.match(r"^REGION\s+([IVXLC]+)(?:\s*([AB]))?$", text)
+    if roman_match:
+        roman_value = roman_match.group(1)
+        suffix = roman_match.group(2)
+        return f"REGION {roman_value}{('-' + suffix) if suffix else ''}"
+
+    return text
+
+
+def normalize_main_dataframe(main_df):
+    normalized = main_df.copy()
+    if "region" in normalized.columns:
+        normalized["region"] = normalized["region"].apply(normalize_region_value)
+    if "commodity_name" in normalized.columns:
+        normalized["commodity_name"] = normalized["commodity_name"].apply(normalize_commodity_value)
+    return normalized
 
 
 class DataFrameHTMLParser(HTMLParser):
@@ -154,6 +256,114 @@ def load_ensemble_weight_lookup():
     return {row["series_id"]: row.to_dict() for _, row in weights.iterrows()}
 
 
+def build_global_weight_template(ensemble_weight_lookup):
+    if not ensemble_weight_lookup:
+        return {
+            "sarima_inner_rmse": np.nan,
+            "svr_inner_rmse": np.nan,
+            "lightgbm_inner_rmse": np.nan,
+        }
+
+    weights_frame = pd.DataFrame(list(ensemble_weight_lookup.values()))
+    return {
+        "sarima_inner_rmse": weights_frame["sarima_inner_rmse"].median(),
+        "svr_inner_rmse": weights_frame["svr_inner_rmse"].median(),
+        "lightgbm_inner_rmse": weights_frame["lightgbm_inner_rmse"].median(),
+    }
+
+
+def clone_settings_with_series(template, series_meta):
+    cloned = dict(template)
+    cloned["series_id"] = series_meta["series_id"]
+    cloned["region"] = series_meta["region"]
+    cloned["commodity_name"] = series_meta["commodity_name"]
+    cloned["template_series_id"] = template.get("series_id")
+    cloned["used_fallback_template"] = template.get("series_id") != series_meta["series_id"]
+    return cloned
+
+
+def select_best_template(candidates, model_name, series_meta, ensemble_weight_lookup):
+    if not candidates:
+        return None
+
+    target_commodity = series_meta.get("commodity_name")
+    target_region = series_meta.get("region")
+    rmse_key = MODEL_RMSE_KEYS.get(model_name)
+
+    def score(candidate):
+        weight_row = ensemble_weight_lookup.get(candidate.get("series_id"), {})
+        rmse_value = weight_row.get(rmse_key, np.nan) if rmse_key else np.nan
+        return (
+            0 if candidate.get("commodity_name") == target_commodity else 1,
+            0 if candidate.get("region") == target_region else 1,
+            1 if pd.isna(rmse_value) else 0,
+            float(rmse_value) if pd.notna(rmse_value) else np.inf,
+            -int(candidate.get("rows_trained", 0) or 0),
+            str(candidate.get("series_id", "")),
+        )
+
+    return min(candidates, key=score)
+
+
+def resolve_model_settings_lookup(raw_lookup, model_name, series_manifest, ensemble_weight_lookup):
+    resolved_lookup = {}
+    candidates = list(raw_lookup.values())
+
+    for row in series_manifest[["series_id", "region", "commodity_name"]].drop_duplicates().to_dict(orient="records"):
+        series_id = row["series_id"]
+        exact_settings = raw_lookup.get(series_id)
+        if exact_settings is not None:
+            resolved_lookup[series_id] = clone_settings_with_series(exact_settings, row)
+            continue
+
+        fallback_settings = select_best_template(candidates, model_name, row, ensemble_weight_lookup)
+        if fallback_settings is not None:
+            resolved_lookup[series_id] = clone_settings_with_series(fallback_settings, row)
+
+    return resolved_lookup
+
+
+def resolve_ensemble_weight_lookup(ensemble_weight_lookup, series_manifest, model_candidates):
+    resolved_lookup = {}
+    global_template = build_global_weight_template(ensemble_weight_lookup)
+    candidate_rows = []
+    for series_meta in model_candidates.values():
+        candidate_series_id = series_meta.get("series_id")
+        weight_row = ensemble_weight_lookup.get(candidate_series_id)
+        if weight_row is None:
+            continue
+        enriched = dict(weight_row)
+        enriched["region"] = series_meta.get("region")
+        enriched["commodity_name"] = series_meta.get("commodity_name")
+        candidate_rows.append(enriched)
+
+    for row in series_manifest[["series_id", "region", "commodity_name"]].drop_duplicates().to_dict(orient="records"):
+        series_id = row["series_id"]
+        if series_id in ensemble_weight_lookup:
+            exact_weight = dict(ensemble_weight_lookup[series_id])
+            exact_weight["region"] = row["region"]
+            exact_weight["commodity_name"] = row["commodity_name"]
+            exact_weight["template_series_id"] = series_id
+            exact_weight["used_fallback_template"] = False
+            resolved_lookup[series_id] = exact_weight
+            continue
+
+        fallback_weight = select_best_template(candidate_rows, "LightGBM", row, ensemble_weight_lookup)
+        if fallback_weight is not None:
+            borrowed_weight = dict(fallback_weight)
+        else:
+            borrowed_weight = dict(global_template)
+
+        borrowed_weight["series_id"] = series_id
+        borrowed_weight["region"] = row["region"]
+        borrowed_weight["commodity_name"] = row["commodity_name"]
+        borrowed_weight["template_series_id"] = fallback_weight.get("series_id") if fallback_weight is not None else "__global__"
+        borrowed_weight["used_fallback_template"] = True
+        resolved_lookup[series_id] = borrowed_weight
+
+    return resolved_lookup
+
+
 def validate_main_dataset(df_main):
     required_columns = {"region", "commodity_name", "month", "price"}
     missing = sorted(required_columns.difference(df_main.columns))
@@ -165,7 +375,7 @@ def prepare_base_panel(main_df=None):
     if main_df is None:
         df_main = pd.read_csv(ROOT / "data" / "main" / "Combined Main Dataset.csv", low_memory=False)
     else:
-        df_main = main_df.copy()
+        df_main = normalize_main_dataframe(main_df)
 
     validate_main_dataset(df_main)
     df_main["month"] = pd.to_datetime(df_main["month"], errors="coerce")
@@ -261,12 +471,11 @@ def prepare_base_panel(main_df=None):
     regional_series_manifest, regional_preprocessed_panel = hf.build_series_manifest(regional_preprocessed_full)
     all_eligible_series_manifest = regional_series_manifest.copy()
 
-    if len(all_eligible_series_manifest) >= MODEL_SERIES_CAP:
-        modeling_series_cap = MODEL_SERIES_CAP
-    elif len(all_eligible_series_manifest) >= MODEL_SERIES_CAP_FALLBACK:
-        modeling_series_cap = MODEL_SERIES_CAP_FALLBACK
-    else:
-        modeling_series_cap = len(all_eligible_series_manifest)
+    modeling_series_cap = hf.resolve_modeling_series_cap(
+        len(all_eligible_series_manifest),
+        MODEL_SERIES_CAP,
+        MODEL_SERIES_CAP_FALLBACK,
+    )
 
     eligible_series_manifest = (
         hf.select_series_manifest_balanced(
@@ -871,10 +1080,38 @@ def compute_model_consistency_summary(series_metrics_frame):
 def build_dashboard_payload(main_df=None):
     eligible_panel, eligible_series_manifest, regional_exogenous_feature_columns = prepare_base_panel(main_df=main_df)
 
-    sarima_settings_lookup = load_artifact_payloads("SARIMA", "sarima")
-    svr_settings_lookup = load_artifact_payloads("SVR", "svr")
-    lightgbm_settings_lookup = load_artifact_payloads("LightGBM", "lightgbm")
-    ensemble_weight_lookup = load_ensemble_weight_lookup()
+    raw_sarima_settings_lookup = load_artifact_payloads("SARIMA", "sarima")
+    raw_svr_settings_lookup = load_artifact_payloads("SVR", "svr")
+    raw_lightgbm_settings_lookup = load_artifact_payloads("LightGBM", "lightgbm")
+    raw_ensemble_weight_lookup = load_ensemble_weight_lookup()
+
+    sarima_settings_lookup = resolve_model_settings_lookup(
+        raw_sarima_settings_lookup,
+        "SARIMA",
+        eligible_series_manifest,
+        raw_ensemble_weight_lookup,
+    )
+    svr_settings_lookup = resolve_model_settings_lookup(
+        raw_svr_settings_lookup,
+        "SVR",
+        eligible_series_manifest,
+        raw_ensemble_weight_lookup,
+    )
+    lightgbm_settings_lookup = resolve_model_settings_lookup(
+        raw_lightgbm_settings_lookup,
+        "LightGBM",
+        eligible_series_manifest,
+        raw_ensemble_weight_lookup,
+    )
+    model_candidates = {}
+    model_candidates.update(raw_sarima_settings_lookup)
+    model_candidates.update(raw_svr_settings_lookup)
+    model_candidates.update(raw_lightgbm_settings_lookup)
+    ensemble_weight_lookup = resolve_ensemble_weight_lookup(
+        raw_ensemble_weight_lookup,
+        eligible_series_manifest,
+        model_candidates,
+    )
 
     sarima_parts = []
     svr_parts = []
@@ -919,7 +1156,9 @@ def build_dashboard_payload(main_df=None):
     )
 
     if not ensemble_predictions.empty:
-        weights_frame = pd.DataFrame(list(ensemble_weight_lookup.values()))
+        weights_frame = pd.DataFrame(list(ensemble_weight_lookup.values()))[
+            ["series_id", "sarima_inner_rmse", "svr_inner_rmse", "lightgbm_inner_rmse"]
+        ]
         ensemble_predictions = ensemble_predictions.merge(weights_frame, on="series_id", how="left")
 
         weighted_preds = []

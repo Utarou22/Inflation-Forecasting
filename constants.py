@@ -19,6 +19,7 @@ DRIVER_COLUMNS = [
 # Panel filtering
 WINDOW_MIN_MONTHS = 36
 WINDOW_MAX_MONTHS = 60
+# Set to -1 to use all eligible series.
 MODEL_SERIES_CAP = 100
 MODEL_SERIES_CAP_FALLBACK = 50
 

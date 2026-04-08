@@ -131,8 +131,6 @@ commodity_granger_monthly = (
     .reset_index(drop=True)
 )
 
-print(commodity_granger_monthly.head())
-
 granger_result_frames = []
 for transform_mode in TRANSFORM_MODES:
     transform_rows = []
@@ -305,12 +303,11 @@ regional_series_manifest, regional_preprocessed_panel = hf.build_series_manifest
 
 all_eligible_series_manifest = regional_series_manifest.copy()
 
-if len(all_eligible_series_manifest) >= MODEL_SERIES_CAP:
-    modeling_series_cap = MODEL_SERIES_CAP
-elif len(all_eligible_series_manifest) >= MODEL_SERIES_CAP_FALLBACK:
-    modeling_series_cap = MODEL_SERIES_CAP_FALLBACK
-else:
-    modeling_series_cap = len(all_eligible_series_manifest)
+modeling_series_cap = hf.resolve_modeling_series_cap(
+    len(all_eligible_series_manifest),
+    MODEL_SERIES_CAP,
+    MODEL_SERIES_CAP_FALLBACK,
+)
 
 eligible_series_manifest = (
     hf.select_series_manifest_balanced(

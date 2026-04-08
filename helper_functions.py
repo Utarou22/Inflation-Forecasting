@@ -55,6 +55,47 @@ LIGHTGBM_BASE_FEATURES = const.LIGHTGBM_BASE_FEATURES
 LIGHTGBM_TRIALS = const.LIGHTGBM_TRIALS
 LIGHTGBM_RANDOM_STATE = const.LIGHTGBM_RANDOM_STATE
 
+
+def _progress_message(task_name, completed, total, label=None, status="done"):
+    total = max(int(total or 0), 0)
+    completed = min(max(int(completed or 0), 0), total) if total else int(completed or 0)
+    if total > 0:
+        message = f"[{task_name}] {completed}/{total}"
+    else:
+        message = f"[{task_name}] {completed}"
+    if status and status != "done":
+        message = f"{message} ({status})"
+    if label:
+        message = f"{message}: {label}"
+    return message
+
+
+def log_progress(task_name, completed, total, label=None, status="done"):
+    print(_progress_message(task_name, completed, total, label=label, status=status), flush=True)
+
+
+def log_completed_task(task_name, completed, total, label=None, status="done"):
+    log_progress(task_name, completed, total, label=label, status=status)
+
+
+@contextmanager
+def joblib_progress(task_name, total=None):
+    original_callback = joblib.parallel.BatchCompletionCallBack
+    state = {"completed": 0, "total": int(total or 0)}
+
+    class ProgressBatchCompletionCallBack(original_callback):
+        def __call__(self, *args, **kwargs):
+            batch_size = self.batch_size or 1
+            state["completed"] += batch_size
+            log_progress(task_name, state["completed"], state["total"])
+            return super().__call__(*args, **kwargs)
+
+    joblib.parallel.BatchCompletionCallBack = ProgressBatchCompletionCallBack
+    try:
+        yield
+    finally:
+        joblib.parallel.BatchCompletionCallBack = original_callback
+
 def get_environment_config():
     sys_name = platform.system().lower()
     backend = "loky"
@@ -67,9 +108,9 @@ def get_environment_config():
 
         try:
             p_cores = int(os.popen("sysctl -n hw.perflevel0.physicalcpu").read().strip())
-            return p_cores
+            return p_cores, backend
         except:
-            return 4
+            return 4, backend
     return n_jobs, backend
 
 def series_label(meta):
@@ -392,6 +433,25 @@ def select_series_manifest_balanced(
     )
     selected["selection_rank"] = np.arange(1, len(selected) + 1)
     return selected.drop(columns=["_selection_group"])
+
+
+def resolve_modeling_series_cap(total_series, primary_cap, fallback_cap=None):
+    if total_series <= 0:
+        return 0
+
+    if primary_cap is None or primary_cap == -1:
+        return total_series
+
+    if primary_cap <= 0:
+        return total_series
+
+    if total_series >= primary_cap:
+        return primary_cap
+
+    if fallback_cap is not None and fallback_cap > 0 and total_series >= fallback_cap:
+        return fallback_cap
+
+    return total_series
 
 def lagged_autocorr(series, lag):
     series = pd.Series(series).dropna()
