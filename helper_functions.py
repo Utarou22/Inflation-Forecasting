@@ -97,6 +97,8 @@ def get_environment_config():
             return p_cores, backend
         except:
             return 4, backend
+    if sys_name == "windows":
+        return max(8, n_jobs), backend
     return n_jobs, backend
 
 def series_label(meta):
